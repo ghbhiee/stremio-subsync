@@ -23,9 +23,9 @@ const CACHE_DIR = process.env.CACHE_DIR || '/var/lib/stremio-subsync';
 const FFMPEG = process.env.FFMPEG_BIN || '/usr/bin/ffmpeg';
 const FFPROBE = process.env.FFPROBE_BIN || '/usr/bin/ffprobe';
 const REF_SECONDS = Number(process.env.REF_SECONDS || 600);
-const LIST_WAIT_MS = Number(process.env.LIST_WAIT_MS || 15000);
+const LIST_WAIT_MS = Number(process.env.LIST_WAIT_MS || 8000);
 const SUB_WAIT_MS = Number(process.env.SUB_WAIT_MS || 40000);
-const TRANSLATE_WAIT_MS = Number(process.env.TRANSLATE_WAIT_MS || 40000); // stay under nginx's default 60 s
+const TRANSLATE_WAIT_MS = Number(process.env.TRANSLATE_WAIT_MS || 40000); // browser -> nginx /subtitles.vtt allows 60 s
 const GOOD_CUES = Number(process.env.GOOD_CUES || 0.55);   // cue-start match ratio vs embedded track
 const GOOD_SPEECH = Number(process.env.GOOD_SPEECH || 0.6); // share of subtitle time on detected speech
 const RETRY_AFTER_MS = 60000;
@@ -284,11 +284,12 @@ async function translationState(job) {
 }
 
 async function serveTranslated(res, job, variant) {
+  if (!(job.entries || []).some((e) => ENG.has(e.lang))) return send(res, 404, 'no english subtitle');
+  beginText(res);
   const deadline = Date.now() + TRANSLATE_WAIT_MS;
   // Give a running alignment a moment so the translation lands on the best-aligned English subtitle.
   while (job.promise && !bestEntry(job, ENG, { alignedOnly: true }) && Date.now() < deadline - 25000) await sleep(500);
   const entry = bestEntry(job, ENG);
-  if (!entry) return send(res, 404, 'no english subtitle');
   const t = await startTranslation(job);
   if (t && !t.done) await Promise.race([t.promise, sleep(Math.max(0, deadline - Date.now()))]);
   const cues = await loadCues(job, entry);
@@ -298,12 +299,13 @@ async function serveTranslated(res, job, variant) {
     return { ...c, text: variant === 'mt-zh' ? (cn || en) : (cn ? `${cn}\n${en}` : en) };
   });
   log('serve', variant, titleFor(job), `${Object.keys(zh).length}/${cues.length} translated`);
-  send(res, 200, formatSrt(out.sort((a, b) => a.start - b.start)), 'text/plain; charset=utf-8');
+  res.end(formatSrt(out.sort((a, b) => a.start - b.start)));
 }
 
 async function serveHumanBilingual(res, job) {
   const en = bestEntry(job, ENG, { alignedOnly: true }), cn = bestEntry(job, CHI, { alignedOnly: true });
   if (!en || !cn) return send(res, 404, 'needs aligned english and chinese subtitles');
+  beginText(res);
   const enCues = (await loadCues(job, en)).sort((a, b) => a.start - b.start);
   const cnCues = (await loadCues(job, cn)).sort((a, b) => a.start - b.start);
   let j = 0;
@@ -316,7 +318,7 @@ async function serveHumanBilingual(res, job) {
     }
     return { ...c, text: parts.length ? `${[...new Set(parts)].join(' ')}\n${c.text}` : c.text };
   });
-  send(res, 200, formatSrt(out), 'text/plain; charset=utf-8');
+  res.end(formatSrt(out));
 }
 
 // ---------- HTTP ----------
@@ -411,6 +413,7 @@ async function handleSub(res, shortKey, key) {
   if (key === 'bilingual') return serveHumanBilingual(res, job);
   const entry = (job.entries || []).find((e) => subKey(e) === key);
   if (!entry) return send(res, 404, 'unknown subtitle');
+  beginText(res);
   const deadline = Date.now() + SUB_WAIT_MS;
   while (Date.now() < deadline) {
     const r = job.results[key];
@@ -422,8 +425,15 @@ async function handleSub(res, shortKey, key) {
   const aligned = path.join(job.dir, `${key}.srt`), orig = path.join(job.dir, `${key}.orig.srt`);
   const r = job.results[key];
   const file = r && r.status === 'done' && fs.existsSync(aligned) ? aligned : (fs.existsSync(orig) ? orig : null);
-  if (file) return send(res, 200, await fsp.readFile(file, 'utf8'), 'text/plain; charset=utf-8');
-  send(res, 200, await fetchText(entry.url, 30000), 'text/plain; charset=utf-8');
+  res.end(file ? await fsp.readFile(file, 'utf8') : await fetchText(entry.url, 30000));
+}
+
+// The streaming engine fetches subtitle files with a 10 s timeout that is cleared once response headers
+// arrive, so send them right away and deliver the body when alignment or translation is ready.
+function beginText(res) {
+  if (res.headersSent) return;
+  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
+  res.flushHeaders();
 }
 
 function send(res, code, body, type) {
@@ -457,5 +467,6 @@ http.createServer(async (req, res) => {
   } catch (e) {
     log('request error', req.url.replace(TOKEN, '<token>'), e.message);
     if (!res.headersSent) send(res, 500, { error: 'internal error' });
+    else res.end();
   }
 }).listen(PORT, HOST, () => log(`subsync listening on http://${HOST}:${PORT} (translation: ${translate.enabled() ? translate.MODEL : 'off'})`));
