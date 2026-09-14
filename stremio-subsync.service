@@ -1,0 +1,23 @@
+[Unit]
+Description=Stremio subtitle alignment addon
+After=network-online.target stremio-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stremio
+Group=stremio
+EnvironmentFile=/etc/stremio/subsync.env
+Environment=CACHE_DIR=/var/lib/stremio-subsync
+StateDirectory=stremio-subsync
+ExecStart=/opt/stremio-node/bin/node /opt/stremio-subsync/server.js
+Restart=on-failure
+RestartSec=5
+Nice=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
