@@ -28,6 +28,9 @@ const SUB_WAIT_MS = Number(process.env.SUB_WAIT_MS || 40000);
 const TRANSLATE_WAIT_MS = Number(process.env.TRANSLATE_WAIT_MS || 40000); // browser -> nginx /subtitles.vtt allows 60 s
 const GOOD_CUES = Number(process.env.GOOD_CUES || 0.55);   // cue-start match ratio vs embedded track
 const GOOD_SPEECH = Number(process.env.GOOD_SPEECH || 0.6); // share of subtitle time on detected speech
+const GOOD_CONSENSUS = Number(process.env.GOOD_CONSENSUS || 0.9); // agreement with the consensus subtitle
+const CONSENSUS_CANDIDATES = Number(process.env.CONSENSUS_CANDIDATES || 6);
+const CONSENSUS_WINDOW = 1200; // seconds compared when picking the consensus subtitle
 const RETRY_AFTER_MS = 60000;
 const RMS_BIN = 0.05;
 // Audio-only alignment (no embedded subtitle track) is experimental: an energy VAD misreads laugh tracks
@@ -84,12 +87,35 @@ async function findVideo(size, filename) {
     for (let i = 0; i < t.files.length; i++) {
       const f = t.files[i];
       if (size && Number(f.length) !== Number(size)) continue;
-      const hit = { url: `${ENGINE}/${ih}/${i}`, name: f.name };
+      const hit = { url: `${ENGINE}/${ih}/${i}`, name: f.name, length: Number(f.length) };
       if (!base || f.name.split('/').pop() === base) return hit;
-      fallback = fallback || hit;
+      if (size) fallback = fallback || hit;
     }
   }
   return fallback;
+}
+
+// Stremio asks for subtitles first with only a file name, then again with videoSize/videoHash, and
+// stremio-web keys addon subtitles by list position ("<addon>_<index>"), keeping the first one it saw.
+// Different lists for the two requests therefore drop entries. Resolve size and hash of a file-name-only
+// request through the engine so both requests get the same list.
+const hashCache = new Map();
+async function resolveVideoParams(params) {
+  let size = params.get('videoSize'), hash = params.get('videoHash');
+  const filename = params.get('filename') || '';
+  if (size && hash) return { size, hash, filename };
+  if (!filename) return null;
+  const video = await findVideo(size, filename).catch(() => null);
+  if (!video) return null;
+  size = size || String(video.length);
+  if (!hash) {
+    if (!hashCache.has(video.url)) {
+      const res = await fetchText(`${ENGINE}/opensubHash?videoUrl=${encodeURIComponent(video.url)}`, 20000).then(JSON.parse).catch(() => null);
+      if (res && res.result && res.result.hash) hashCache.set(video.url, res.result.hash);
+    }
+    hash = hashCache.get(video.url);
+  }
+  return hash ? { size, hash, filename } : null;
 }
 
 async function buildReference(job) {
@@ -151,7 +177,10 @@ function heuristic(job, entry) {
 }
 
 function isGood(r) {
-  return (r.refMode || '').startsWith('embedded') ? r.score >= GOOD_CUES : r.score >= GOOD_SPEECH;
+  const mode = r.refMode || '';
+  if (mode.startsWith('embedded')) return r.score >= GOOD_CUES;
+  if (mode.startsWith('consensus')) return r.score >= GOOD_CONSENSUS;
+  return r.score >= GOOD_SPEECH;
 }
 
 async function saveResults(job) {
@@ -176,6 +205,7 @@ async function alignOne(job, entry) {
     await fsp.writeFile(path.join(job.dir, `${key}.times.json`), JSON.stringify(res.aligned));
     await fsp.writeFile(path.join(job.dir, `${key}.srt`), formatSrt(blocks.map((b, i) => ({ ...b, start: res.aligned[i][0], end: res.aligned[i][1] }))));
     Object.assign(r, {
+      cjk: blocks.filter((b) => /[\u3400-\u9fff]/.test(b.text)).length / blocks.length,
       status: 'done', refMode: job.refMode, score: res.score, origScore: res.origScore,
       scale: res.scale, offset: res.offset, pieces: new Set(res.pieces.map((p) => p.offset.toFixed(1))).size,
     });
@@ -215,12 +245,18 @@ function runJob(job, entries) {
   job.status = 'running';
   job.promise = (async () => {
     await fsp.mkdir(job.dir, { recursive: true });
-    const video = await findVideo(job.size, job.filename);
-    if (!video) { job.status = 'novideo'; log('video not in engine', job.key); return; }
-    job.videoUrl = video.url;
     if (!job.ref) {
-      await buildReference(job);
-      if (!job.ref) { job.status = 'noref'; log('no embedded subtitle track; timings left unchanged', job.key); return; }
+      const video = await findVideo(job.size, job.filename).catch((e) => { log('engine lookup failed', e.message); return null; });
+      if (video) {
+        job.videoUrl = video.url;
+        await buildReference(job);
+      }
+      if (!job.ref) await consensusReference(job, entries);
+      if (!job.ref) {
+        job.status = video ? 'noref' : 'novideo';
+        log(video ? 'no embedded subtitles and no consensus; timings left unchanged' : 'video not in engine and no consensus', job.key);
+        return;
+      }
       log('reference', job.key, job.refMode, `window=${Math.round(job.ref.windowEnd)}s`);
     }
     const todo = entries.filter((e) => ALIGN_LANGS.has(e.lang) && (job.results[subKey(e)] || {}).status !== 'done')
@@ -232,11 +268,44 @@ function runJob(job, entries) {
   return job.promise;
 }
 
+// Without an embedded track, use the subtitle that most other candidates agree with (after fitting scale
+// and offset) as the reference. It needs at least two others agreeing >= GOOD_CONSENSUS, so a lone or
+// split field gives no reference. This finds the common timeline, not proof that it matches the video.
+async function consensusReference(job, entries) {
+  let pool = entries.filter((e) => ENG.has(e.lang));
+  if (pool.length < 3) pool = entries.filter((e) => ALIGN_LANGS.has(e.lang));
+  pool = pool.map((e, i) => ({ e, s: heuristic(job, e) - i * 0.01 })).sort((a, b) => b.s - a.s).slice(0, CONSENSUS_CANDIDATES).map((x) => x.e);
+  const subs = [];
+  for (const e of pool) {
+    try {
+      const blocks = parseSrt(await fsp.readFile(await downloadOriginal(job, e), 'utf8'));
+      if (blocks.length >= 20) subs.push({ e, cues: blocks.map((b) => [b.start, b.end]) });
+    } catch (err) { log('consensus download failed', subKey(e), err.message); }
+  }
+  if (subs.length < 3) return;
+  const early = (cues) => cues.filter((c) => c[0] < CONSENSUS_WINDOW);
+  const agree = subs.map(() => []);
+  for (let i = 0; i < subs.length; i++) {
+    for (let j = i + 1; j < subs.length; j++) {
+      const a = early(subs[i].cues), b = early(subs[j].cues);
+      if (a.length < 10 || b.length < 10) { agree[i].push(0); agree[j].push(0); continue; }
+      const v = Math.min(align(b, { cues: a, windowEnd: CONSENSUS_WINDOW }).score, align(a, { cues: b, windowEnd: CONSENSUS_WINDOW }).score);
+      agree[i].push(v); agree[j].push(v);
+    }
+  }
+  const best = subs.map((x, i) => ({ ...x, strong: agree[i].filter((v) => v >= GOOD_CONSENSUS).length, mean: agree[i].reduce((p, c) => p + c, 0) / agree[i].length }))
+    .sort((a, b) => b.strong - a.strong || b.mean - a.mean)[0];
+  if (best.strong < 2) return;
+  job.refMode = `consensus:${subKey(best.e)}`;
+  job.ref = { cues: best.cues, windowEnd: best.cues[best.cues.length - 1][1] };
+}
+
 // Best subtitle of a language: highest aligned score if alignment finished, else the heuristic favourite.
 function bestEntry(job, langs, { alignedOnly = false } = {}) {
   const list = (job.entries || []).filter((e) => langs.has(e.lang));
   const aligned = list.map((e) => ({ e, r: job.results[subKey(e)] }))
-    .filter((x) => x.r && x.r.status === 'done' && isGood(x.r)).sort((a, b) => b.r.score - a.r.score);
+    .filter((x) => x.r && x.r.status === 'done' && isGood(x.r) && (langs !== CHI || (x.r.cjk || 0) >= 0.3))
+    .sort((a, b) => b.r.score - a.r.score);
   if (aligned.length) return aligned[0].e;
   if (alignedOnly || !list.length) return null;
   return list.map((e, i) => ({ e, s: heuristic(job, e) - i * 0.01 })).sort((a, b) => b.s - a.s)[0].e;
@@ -325,6 +394,10 @@ async function serveHumanBilingual(res, job) {
 
 const upstreamCache = new Map();
 
+function canonicalExtra({ filename, size, hash }) {
+  return `filename=${encodeURIComponent(filename)}&videoSize=${size}&videoHash=${hash}`;
+}
+
 async function upstreamList(type, id, extra) {
   const url = `${UPSTREAM}/subtitles/${type}/${encodeURIComponent(id)}${extra ? `/${extra}` : ''}.json`;
   const hit = upstreamCache.get(url);
@@ -338,7 +411,7 @@ function labelFor(job, entry, rank) {
   if (!ALIGN_LANGS.has(entry.lang)) return undefined;
   const tag = releaseTag(entry);
   const suffix = tag ? ` · ${tag}` : '';
-  if (job.status === 'noref') return `未对齐(片源无内嵌字幕)${suffix}`;
+  if (job.status === 'noref' || job.status === 'novideo') return `未校验(无可用参考)${suffix}`;
   if (UNALIGNED.has(job.status)) return `未对齐${suffix}`;
   const r = job.results[subKey(entry)];
   if (!r || r.status === 'pending') return `⏳ 对齐中${suffix}`;
@@ -348,8 +421,9 @@ function labelFor(job, entry, rank) {
   if (Math.abs(r.offset || 0) >= 0.5) notes.push(`原偏移${r.offset > 0 ? '+' : ''}${r.offset.toFixed(1)}s`);
   if (r.scale && Math.abs(r.scale - 1) > 0.01) notes.push('帧率校正');
   const note = notes.length ? ` · ${notes.join(' ')}` : '';
-  if (isGood(r)) return `${rank === 0 ? '✅ 最佳' : '✅ 已对齐'} ${pct}%${note}${suffix}`;
-  return `⚠️ 不匹配 ${pct}%${suffix}`;
+  const consensus = (r.refMode || '').startsWith('consensus');
+  if (isGood(r)) return `${rank === 0 ? '✅ 最佳' : '✅ 已对齐'} ${pct}%${consensus ? ' · 多字幕共识' : ''}${note}${suffix}`;
+  return consensus ? `⚠️ 与多数字幕不一致 ${pct}%${suffix}` : `⚠️ 不匹配 ${pct}%${suffix}`;
 }
 
 function subUrl(job, name) {
@@ -392,9 +466,15 @@ async function extraTracks(job, entries) {
 
 async function handleSubtitles(res, type, id, extra) {
   const params = new URLSearchParams(extra || '');
-  const size = params.get('videoSize'), filename = params.get('filename') || '', hash = params.get('videoHash') || '';
-  const entries = await upstreamList(type, id, extra);
-  if (!size && !filename) return send(res, 200, { subtitles: entries.map((e) => ({ id: `subsync-${subKey(e)}`, lang: e.lang, url: e.url })) });
+  let video = await resolveVideoParams(params);
+  if (!video && params.get('videoSize') && params.get('videoHash')) {
+    video = { size: params.get('videoSize'), hash: params.get('videoHash'), filename: params.get('filename') || '' };
+  }
+  // A partial request we cannot complete would give a shorter list than the follow-up request with the hash,
+  // and stremio-web would then drop the first entries of the full list. Let the complete request fill it.
+  if (!video) return send(res, 200, { subtitles: [], cacheMaxAge: 0 });
+  const { size, filename, hash } = video;
+  const entries = await upstreamList(type, id, canonicalExtra(video));
   const videoKey = `${hash}|${size}|${filename}`;
   const job = getJob(videoKey, { size, filename, type, id });
   job.entries = entries;
