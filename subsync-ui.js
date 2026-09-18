@@ -2,10 +2,12 @@
 // It attaches a bar above the player's subtitles menu (bilingual switch, "generate AI Chinese subtitle"
 // and "align" buttons, live progress) and shows notifications when the work finishes (the finished
 // subtitle is then loaded without interrupting playback). It also keeps English first and Chinese
-// second in the language list, maps A/S/D to previous / repeat / next sentence, pauses while the mouse
-// rests on the subtitle and shows a Chinese dictionary entry when an English word is clicked, for
-// addon subtitles and for subtitle tracks embedded in the video alike. Everything is best-effort: if
-// the player's internals cannot be found, the stock UI keeps working unchanged.
+// second in the language list, maps A/S/D to previous / repeat / next sentence, E to play / pause and Q
+// to "pause after every sentence", pauses while the mouse rests on the subtitle and shows a Chinese
+// dictionary entry when an English word is clicked, for addon subtitles and for subtitle tracks embedded
+// in the video alike. Words can be saved from that popup into a vocabulary book kept on the server (one
+// per user); a button in the control bar opens it in a panel on the right. Everything is best-effort:
+// if the player's internals cannot be found, the stock UI keeps working unchanged.
 (function () {
   'use strict';
 
@@ -15,8 +17,9 @@
   var SUB_RE = /\/sub\/([0-9a-f]{16})\/([^/?#]+)\.srt(?:\?([^#]*))?$/;
   var CHI = { chi: 1, zho: 1, zht: 1, zhs: 1, chs: 1, cht: 1, ze: 1, zh: 1 };
   var TRAD = '繁体中文'; // the addon lists Traditional Chinese as a language of its own, named like this
-  var LS_BI = 'subsync.bilingual', LS_HOVER = 'subsync.hoverPause';
+  var LS_BI = 'subsync.bilingual', LS_HOVER = 'subsync.hoverPause', LS_SP = 'subsync.sentencePause', LS_PROFILE = 'subsync.profile';
   var POLL_MS = 2500;
+  var SP_MARGIN = 120; // sentence pause stops this many ms before the cue ends, so its text stays on screen
   var ORIGIN = '字幕对齐';
 
   var st = {
@@ -28,8 +31,12 @@
     pausedByHover: false, hovering: false, hoverTimer: null, popup: null, popupWord: null,
     menuObserver: null, videoObserver: null, bar: null, barKey: '', wantMt: false, wantBi: false, biApplied: false, internalSelect: false,
     embeddedId: null, embTrack: null, embEl: null,
+    timeOffset: 0, spTimer: null, spDone: null, spWait: null, pausedBySentence: false, hoverSuppressed: false, pill: null, pillKey: '', overPill: false,
+    meta: null, pendingSeek: null, vbtn: null, panel: null, panelOpen: false,
+    vocab: { loaded: false, loading: null, words: {}, user: null, error: '' },
     embStyle: { size: 100, offset: 0, offsetMin: 0, color: 'rgb(255, 255, 255)', bg: 'rgba(0, 0, 0, 0)', outline: 'rgb(34, 34, 34)' },
   };
+  var spOn = false; // "pause after every sentence", set from localStorage below
   var bound = typeof WeakSet === 'function' ? new WeakSet() : { has: function () { return false; }, add: function () {} };
   window.__subsync = st; // read-only debugging handle
 
@@ -66,6 +73,7 @@
     for (var i = 0; i < st.tracks.length; i++) if (st.tracks[i].id === st.selectedId) return st.tracks[i];
     return null;
   }
+  spOn = pref(LS_SP, false);
   function fmtTime(sec) { sec = Math.max(0, Math.round(sec)); var m = Math.floor(sec / 60), s = sec % 60; return m + ':' + (s < 10 ? '0' : '') + s; }
 
   // ---------- styles ----------
@@ -92,6 +100,22 @@
     '.ss-pop .ss-pw{font-size:1.25rem;font-weight:700}.ss-pop .ss-ph{margin-left:.5rem;font-weight:400;opacity:.75;font-size:.95rem}',
     '.ss-pop .ss-pe{margin-top:.2rem}.ss-pop .ss-pc{margin-top:.4rem;padding-top:.4rem;border-top:1px solid rgba(255,255,255,.15)}',
     '.ss-pop .ss-pl{opacity:.6;font-size:.8rem;margin-right:.3rem}',
+    '.ss-pop .ss-pw{display:flex;align-items:baseline;flex-wrap:wrap;gap:0 .2rem}',
+    '.ss-add{margin-left:auto;flex:none;align-self:center;cursor:pointer;padding:.15rem .55rem;border-radius:1rem;border:1px solid rgba(255,255,255,.4);background:transparent;color:inherit;font:inherit;font-size:.8rem;font-weight:400;white-space:nowrap}',
+    '.ss-add:hover{background:rgba(255,255,255,.15)}.ss-add.on{border-color:transparent;background:var(--secondary-accent-color,#7b5bf5);color:#fff}',
+    '.ss-vbtn svg{fill:currentColor}',
+    '.ss-panel{position:absolute;z-index:46;top:0;right:0;bottom:0;width:26rem;max-width:92%;display:flex;flex-direction:column;background:var(--modal-background-color,rgba(16,16,28,.96));backdrop-filter:blur(15px);box-shadow:-.6rem 0 2rem rgba(0,0,0,.45);color:var(--primary-foreground-color,#fff);font-size:.95rem;line-height:1.45;text-align:left;text-shadow:none;border-radius:var(--border-radius,.75rem) 0 0 var(--border-radius,.75rem)}',
+    '.ss-vh{flex:none;display:flex;align-items:center;gap:.6rem;padding:1rem 1.1rem .7rem}.ss-vh .ss-vt{font-size:1.2rem;font-weight:700}.ss-vh .ss-vx{margin-left:auto;cursor:pointer;font-size:1.4rem;line-height:1;opacity:.7;padding:0 .3rem}.ss-vh .ss-vx:hover{opacity:1}',
+    '.ss-vtabs{flex:none;display:flex;gap:.4rem;padding:0 1.1rem .6rem}.ss-vtab{cursor:pointer;padding:.15rem .7rem;border-radius:1rem;background:rgba(255,255,255,.1);font-size:.85rem}.ss-vtab.on{background:var(--secondary-accent-color,#7b5bf5)}',
+    '.ss-vl{flex:1;overflow-y:auto;padding:0 1.1rem 1.2rem;overscroll-behavior:contain}',
+    '.ss-vi{position:relative;padding:.7rem 1.8rem .7rem 0;border-top:1px solid rgba(255,255,255,.12)}',
+    '.ss-vi .ss-vw{font-size:1.1rem;font-weight:700}.ss-vi .ss-ph{margin-left:.5rem;opacity:.7;font-size:.9rem;font-weight:400}',
+    '.ss-vi .ss-vd{position:absolute;top:.6rem;right:0;cursor:pointer;opacity:.45;font-size:1.1rem;padding:0 .3rem}.ss-vi .ss-vd:hover{opacity:1}',
+    '.ss-vi .ss-vs{margin-top:.35rem;padding:.35rem .55rem;border-radius:.4rem;background:rgba(255,255,255,.07)}.ss-vi .ss-vs.go{cursor:pointer}.ss-vi .ss-vs.go:hover{background:rgba(255,255,255,.14)}',
+    '.ss-vi .ss-vz{opacity:.75;font-size:.88rem}.ss-vi .ss-vm{margin-top:.3rem;opacity:.55;font-size:.8rem}',
+    '.ss-kbd{flex:none;padding:0 .4rem;border:1px solid rgba(255,255,255,.45);border-radius:.3rem;font-size:.8rem;line-height:1.35;opacity:.9}',
+    '.ss-key{display:flex;align-items:center;gap:.3rem;cursor:pointer;padding:.1rem .45rem;border-radius:1rem;background:rgba(255,255,255,.12)}.ss-key:hover{background:rgba(255,255,255,.25)}',
+    '.ss-pill{position:absolute;z-index:44;display:flex;align-items:center;gap:.5rem;padding:.3rem .8rem;border-radius:2rem;background:var(--modal-background-color,rgba(16,16,28,.92));backdrop-filter:blur(12px);box-shadow:0 .4rem 1rem rgba(0,0,0,.4);color:var(--primary-foreground-color,#fff);font-size:.9rem;line-height:1.4;white-space:nowrap;text-shadow:none;user-select:none}',
   ].join('\n');
   var styleEl = el('style'); styleEl.textContent = css; (document.head || document.documentElement).appendChild(styleEl);
 
@@ -119,13 +143,25 @@
     switch (name) {
       case 'stream': {
         var sig = value ? JSON.stringify(value).slice(0, 400) : '';
-        if (sig !== st.streamSig) { st.streamSig = sig; resetVideo(); }
+        if (sig !== st.streamSig) { st.streamSig = sig; resetVideo(); refreshMeta(); }
         break;
       }
-      case 'time': st.time = typeof value === 'number' ? value : null; break;
+      case 'time': {
+        var before = st.time;
+        st.time = typeof value === 'number' ? value : null;
+        if (st.time !== null) {
+          var ve = st.videoEl; // the element's clock is finer than the player's time events (about 4 a second)
+          if (ve && isFinite(ve.currentTime)) st.timeOffset = st.time - ve.currentTime * 1000;
+          if (before === null || Math.abs(st.time - before) > 1500) { st.spDone = null; st.spWait = null; applyPendingSeek(); } // loaded, or a seek
+          if (!st.spTimer) armSentencePause();
+        }
+        break;
+      }
       case 'paused': {
         if (value === false && st.pausedByHover) st.pausedByHover = false; // the user resumed by hand
         st.paused = value;
+        if (value === false) { st.pausedBySentence = false; armSentencePause(); } else disarmSentencePause();
+        renderPill();
         break;
       }
       case 'extraSubtitlesDelay': st.delay = typeof value === 'number' ? value : 0; break;
@@ -163,6 +199,7 @@
       st.menuObserver = new MutationObserver(scheduleMenu);
       st.menuObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'], characterData: true });
     }
+    scheduleMenu();
     return true;
   }
 
@@ -170,6 +207,9 @@
     if (st.embTrack) { try { st.embTrack.removeEventListener('cuechange', renderEmbedded); } catch (e) { /* gone */ } }
     if (st.embEl && st.embEl.parentNode) st.embEl.parentNode.removeChild(st.embEl);
     removeBar();
+    closePanel();
+    if (st.pill && st.pill.parentNode) st.pill.parentNode.removeChild(st.pill);
+    st.pill = null; st.pillKey = ''; st.vbtn = null; st.hovering = false; st.overPill = false;
     st.video = null; st.videoEl = null; st.subsEl = null; st.embTrack = null; st.embEl = null; st.embeddedId = null;
     if (st.menuObserver) { st.menuObserver.disconnect(); st.menuObserver = null; }
     if (st.videoObserver) { st.videoObserver.disconnect(); st.videoObserver = null; }
@@ -182,7 +222,9 @@
     st.shortKey = null; st.status = null; st.statusAt = 0; st.live = {}; st.selSig = null;
     st.alignEpoch = 0; st.mtEpoch = 0; st.mtPartial = false; st.mtPromptShown = false; st.wantMt = false; st.wantBi = false; st.biApplied = false;
     st.preview = []; st.pausedByHover = false; st.barKey = '';
+    disarmSentencePause(); st.spDone = null; st.spWait = null; st.pausedBySentence = false; st.meta = null;
     closePopup();
+    renderPill();
   }
 
   setInterval(function () {
@@ -470,7 +512,7 @@
   function scheduleMenu() { // setTimeout, not requestAnimationFrame: the latter stops in a background tab
     if (menuScheduled) return;
     menuScheduled = true;
-    setTimeout(function () { menuScheduled = false; renderMenu(); }, 30);
+    setTimeout(function () { menuScheduled = false; ensureVocabButton(); if (pillVisible()) renderPill(); renderMenu(); }, 30);
   }
   window.addEventListener('resize', scheduleMenu);
   function findMenu() {
@@ -569,9 +611,9 @@
     var bar = st.bar;
     if (!bar || !bar.parentNode) return;
     var s = st.status, p = mine(selectedTrack());
-    var biNow = isBilingual(p), hover = pref(LS_HOVER, true);
+    var biNow = isBilingual(p), hover = pref(LS_HOVER, true), sp = spOn;
     var key = JSON.stringify([st.shortKey, !s ? null : s.missing ? 'missing' : [s.align.state, s.align.running, s.align.phase, s.align.done, s.align.total, s.align.error,
-      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, st.selectedId, st.embeddedId, st.wantBi]);
+      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, sp, st.selectedId, st.embeddedId, st.wantBi]);
     if (key === st.barKey) return; // nothing changed: leave the DOM alone (the menu observer would loop otherwise)
     st.barKey = key;
     bar.textContent = '';
@@ -605,13 +647,16 @@
         }
       }
     }
+    var spSw = el('div', 'ss-sw' + (sp ? ' on' : ''));
+    spSw.addEventListener('click', function () { setSentencePause(!spOn, false); });
+    bar.appendChild(cell(spSw, el('span', 'ss-title', '逐句暂停'), el('span', 'ss-kbd', 'Q'), el('span', 'ss-muted', '按 Q 开关，停住后按 D 下一句')));
     var chk = el('label', 'ss-chk');
     var input = el('input'); input.type = 'checkbox'; input.checked = hover;
     input.addEventListener('change', function () { setPref(LS_HOVER, input.checked); renderBar(); });
     chk.appendChild(input);
     chk.appendChild(el('span', null, '悬停字幕暂停'));
     bar.appendChild(chk);
-    bar.appendChild(el('span', 'ss-muted', 'A/S/D 上一句/重听/下一句 · 点单词查词'));
+    bar.appendChild(el('span', 'ss-muted', 'A/S/D 上一句/重听/下一句 · E 播放/暂停 · 点单词查词，＋ 加入生词本'));
   }
 
   // ---------- A / S / D: previous sentence, repeat, next sentence ----------
@@ -642,32 +687,164 @@
     if (st.time === null) return;
     var cc = currentCues(), cues = cc.cues;
     if (!cues.length) return;
-    var t = st.time - cc.delay, cur = -1;
-    for (var i = 0; i < cues.length; i++) { if (cues[i].startTime <= t + 150) cur = i; else break; }
+    var t = st.time - cc.delay, cur = -1, i;
+    for (i = 0; i < cues.length; i++) { if (cues[i].startTime <= t + 150) cur = i; else break; }
+    // Stopped at the end of a sentence: that sentence is the current one, however close the next one starts.
+    if (st.pausedBySentence && st.spDone !== null) { for (i = 0; i < cues.length; i++) if (cues[i].startTime === st.spDone) { cur = i; break; } }
     var inGap = cur >= 0 && t > cues[cur].endTime + 300, target = null;
     if (dir > 0) target = cur + 1 < cues.length ? cues[cur + 1] : null;
     else if (dir === 0) target = cur >= 0 ? cues[cur] : cues[0];
     else target = cur < 0 ? cues[0] : (inGap || cur === 0) ? cues[cur] : cues[cur - 1];
     if (!target) return;
+    st.spDone = null; st.spWait = null; // the sentence played next gets its pause, also when it is the same one again
+    st.hoverSuppressed = true; // the mouse may still rest on the subtitle: a key press wins until it moves
     safeDispatch({ type: 'setProp', propName: 'time', propValue: Math.max(0, Math.round(target.startTime + cc.delay - 60)) });
     if (st.paused) { st.pausedByHover = false; safeDispatch({ type: 'setProp', propName: 'paused', propValue: false }); }
     badge(dir < 0 ? '◀ 上一句' : dir === 0 ? '↻ 重听本句' : '下一句 ▶');
   }
-  function navKey(e) {
+  function togglePlay() {
+    if (typeof st.paused !== 'boolean') return;
+    var resume = st.paused;
+    st.pausedByHover = false;
+    if (resume) st.hoverSuppressed = true;
+    safeDispatch({ type: 'setProp', propName: 'paused', propValue: !resume });
+    badge(resume ? '▶ 播放' : '⏸ 暂停');
+  }
+  // A / S / D need a subtitle on screen (without one the keys keep their stock meaning); E and Q are
+  // not used by the player.
+  function keyAction(e) {
     if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || isInputFocused() || !st.video) return null;
     var code = e.code || ('Key' + String(e.key || '').toUpperCase());
+    if (code === 'KeyE') return 'play';
+    if (code === 'KeyQ') return 'sentence';
     if (code !== 'KeyA' && code !== 'KeyS' && code !== 'KeyD') return null;
     if (!currentCues().cues.length) return null; // no subtitle on screen: leave the player's own shortcuts alone
     return code === 'KeyA' ? -1 : code === 'KeyS' ? 0 : 1;
   }
   window.addEventListener('keydown', function (e) {
-    if (st.popup && e.key === 'Escape') { closePopup(); e.preventDefault(); e.stopImmediatePropagation(); return; }
-    var dir = navKey(e);
-    if (dir === null) return;
+    if (e.key === 'Escape' && (st.popup || st.panelOpen)) {
+      if (st.popup) closePopup(); else closePanel();
+      e.preventDefault(); e.stopImmediatePropagation();
+      return;
+    }
+    var act = keyAction(e);
+    if (act === null) return;
     e.preventDefault(); e.stopImmediatePropagation();
-    if (!e.repeat) navigate(dir);
+    if (e.repeat) return;
+    if (act === 'play') togglePlay();
+    else if (act === 'sentence') setSentencePause(!spOn, true);
+    else navigate(act);
   }, true);
-  window.addEventListener('keyup', function (e) { if (navKey(e) !== null) e.stopImmediatePropagation(); }, true);
+  window.addEventListener('keyup', function (e) { if (keyAction(e) !== null) e.stopImmediatePropagation(); }, true);
+
+  // ---------- Q: pause after every sentence ----------
+  // While it is on, playback stops just before each cue ends (its text stays on screen, so words can
+  // still be looked up); D goes on to the next sentence, S repeats this one, A goes back, E just resumes.
+
+  function setSentencePause(on, announce) {
+    spOn = Boolean(on);
+    setPref(LS_SP, spOn);
+    st.spDone = null; st.spWait = null;
+    if (on) armSentencePause(); else { disarmSentencePause(); st.pausedBySentence = false; }
+    if (announce) badge(on ? '逐句暂停：开（D 下一句）' : '逐句暂停：关');
+    renderPill();
+    renderBar();
+  }
+  function disarmSentencePause() { if (st.spTimer) { clearTimeout(st.spTimer); st.spTimer = null; } }
+  function armSentencePause() { disarmSentencePause(); sentenceTick(); }
+  function preciseTime() {
+    var v = st.videoEl;
+    return v && isFinite(v.currentTime) ? v.currentTime * 1000 + st.timeOffset : st.time;
+  }
+  function stopPoint(cues, i) { // where playback stops for cue i: before it ends and before the next one starts
+    var end = cues[i].endTime;
+    if (i + 1 < cues.length && cues[i + 1].startTime < end) end = cues[i + 1].startTime;
+    return Math.max(end - SP_MARGIN, cues[i].startTime + 250);
+  }
+  function sentenceTick() { // setTimeout, not requestAnimationFrame: see scheduleMenu
+    st.spTimer = null;
+    if (!spOn || st.paused !== false || st.time === null || !st.video) return;
+    var cc = currentCues(), cues = cc.cues;
+    if (!cues.length) { st.spTimer = setTimeout(sentenceTick, 1000); return; }
+    var t = preciseTime() - cc.delay, cur = -1;
+    for (var i = 0; i < cues.length; i++) { if (cues[i].startTime <= t + 40) cur = i; else break; }
+    var idx = cur;
+    // Wait for the next sentence instead when this one already had its stop (the viewer resumed), or when
+    // its stop point had passed before we started waiting for it: a jump with A/S/D lands just before the
+    // next cue, a seek or switching on late lands anywhere.
+    if (idx >= 0 && (cues[idx].startTime === st.spDone || (t > stopPoint(cues, idx) - 15 && st.spWait !== cues[idx].startTime))) idx = cur + 1;
+    if (idx < 0) idx = 0;
+    if (idx >= cues.length) { st.spTimer = setTimeout(sentenceTick, 1000); return; }
+    var rate = st.videoEl && st.videoEl.playbackRate > 0 ? st.videoEl.playbackRate : 1;
+    var wait = (stopPoint(cues, idx) - t) / rate;
+    if (wait <= 15) {
+      st.spDone = cues[idx].startTime; st.spWait = null;
+      st.pausedBySentence = true; st.pausedByHover = false;
+      safeDispatch({ type: 'setProp', propName: 'paused', propValue: true });
+      renderPill();
+      return;
+    }
+    st.spWait = cues[idx].startTime;
+    st.spTimer = setTimeout(sentenceTick, Math.min(wait, 500));
+  }
+
+  // The switch shows next to the subtitle while the mouse is on it, and while playback waits at the
+  // end of a sentence (with the keys that go on from there).
+  function cuesRect() {
+    var hosts = [st.subsEl, st.embEl], rect = null;
+    hosts.forEach(function (h) {
+      if (!h) return;
+      for (var i = 0; i < h.children.length; i++) {
+        var c = h.children[i];
+        if (c.tagName === 'BR' || !c.offsetHeight) continue;
+        var r = c.getBoundingClientRect();
+        rect = rect ? { top: Math.min(rect.top, r.top), left: Math.min(rect.left, r.left), right: Math.max(rect.right, r.right) } : { top: r.top, left: r.left, right: r.right };
+      }
+    });
+    return rect;
+  }
+  function pillVisible() { return Boolean(st.pill && st.pill.style.display !== 'none' && st.pill.parentNode); }
+  function renderPill() {
+    if (st.hovering && !cuesRect()) st.hovering = false; // the cue under the mouse is gone (no mouseout for removed nodes)
+    var show = Boolean(st.video && st.videoEl && (st.hovering || st.overPill || st.pausedBySentence));
+    if (!show) {
+      if (st.pill && st.pill.style.display !== 'none') { st.pill.style.display = 'none'; st.pillKey = ''; }
+      return;
+    }
+    var root = st.root || document.body, on = spOn;
+    if (!st.pill) {
+      st.pill = el('div', 'ss-pill');
+      st.pill.addEventListener('mouseenter', function () { st.overPill = true; clearTimeout(st.hoverTimer); });
+      st.pill.addEventListener('mouseleave', function (e) { st.overPill = false; if (!cueNodeOf(e.relatedTarget) && !inPopup(e.relatedTarget)) hoverLeave(); });
+      st.pill.addEventListener('mousemove', function (e) { e.immersePrevented = true; });
+    }
+    if (st.pill.parentNode !== root) root.appendChild(st.pill);
+    var key = (on ? '1' : '0') + (st.pausedBySentence ? 'p' : '');
+    if (key !== st.pillKey) {
+      st.pillKey = key;
+      st.pill.textContent = '';
+      var sw = el('span', 'ss-sw' + (on ? ' on' : ''));
+      var toggle = function () { setSentencePause(!spOn, false); };
+      sw.__ssAct = toggle;
+      var label = el('span', 'ss-title', '逐句暂停'); label.__ssAct = toggle; label.style.cursor = 'pointer';
+      st.pill.appendChild(sw); st.pill.appendChild(label);
+      st.pill.appendChild(el('span', 'ss-kbd', 'Q'));
+      st.pill.appendChild(el('span', 'ss-muted', on ? '按 Q 开关 · 每句播完自动停' : '按 Q 开关'));
+      if (st.pausedBySentence) { // the keys that go on from here, also as buttons (tablets have no keyboard)
+        [['A', '上一句', function () { navigate(-1); }], ['S', '重听', function () { navigate(0); }], ['D', '下一句', function () { navigate(1); }], ['E', '继续', togglePlay]].forEach(function (k) {
+          var b = el('span', 'ss-key'); b.appendChild(el('span', 'ss-kbd', k[0])); b.appendChild(document.createTextNode(k[1]));
+          b.__ssAct = k[2];
+          st.pill.appendChild(b);
+        });
+      }
+    }
+    st.pill.style.display = 'flex';
+    var rr = root.getBoundingClientRect(), cr = cuesRect(), w = st.pill.offsetWidth, h = st.pill.offsetHeight;
+    var mid = cr ? (cr.left + cr.right) / 2 - rr.left : rr.width / 2;
+    var top = cr ? cr.top - rr.top - h - 6 : rr.height * 0.72;
+    st.pill.style.left = Math.round(Math.max(8, Math.min(rr.width - w - 8, mid - w / 2))) + 'px';
+    st.pill.style.top = Math.round(Math.max(8, top)) + 'px';
+  }
 
   // ---------- subtitle text: hover to pause, click a word for its meaning ----------
 
@@ -720,7 +897,9 @@
     if (container.__ssHover) return;
     container.__ssHover = true;
     container.addEventListener('mouseover', function (e) { if (cueNodeOf(e.target)) { st.hovering = true; hoverEnter(); } });
-    container.addEventListener('mouseout', function (e) { if (cueNodeOf(e.target) && !cueNodeOf(e.relatedTarget)) { st.hovering = false; if (!inPopup(e.relatedTarget)) hoverLeave(); } });
+    container.addEventListener('mouseout', function (e) { if (cueNodeOf(e.target) && !cueNodeOf(e.relatedTarget)) { st.hovering = false; if (!inPopup(e.relatedTarget) && !inPill(e.relatedTarget)) hoverLeave(); } });
+    // After A/S/D/E the next sentence appears under a mouse that has not moved: that is not a hover.
+    container.addEventListener('mousemove', function (e) { if (st.hoverSuppressed && cueNodeOf(e.target)) { st.hoverSuppressed = false; hoverEnter(); } });
   }
   // The element holding the cue blocks: the player's own (addon subtitles) or ours (embedded tracks).
   function containerOf(node) {
@@ -797,16 +976,21 @@
     });
   }
   function inPopup(node) { return Boolean(st.popup && node && st.popup.contains(node)); }
+  function inPill(node) { return Boolean(st.pill && node && st.pill.contains(node)); }
+  function inPanel(node) { return Boolean(st.panel && node && st.panel.contains(node)); }
   function hoverEnter() {
     clearTimeout(st.hoverTimer);
-    if (!pref(LS_HOVER, true) || st.paused !== false) return;
+    renderPill();
+    if (st.hoverSuppressed || !pref(LS_HOVER, true) || st.paused !== false) return;
     st.pausedByHover = true;
     safeDispatch({ type: 'setProp', propName: 'paused', propValue: true });
   }
   function hoverLeave() {
     clearTimeout(st.hoverTimer);
     st.hoverTimer = setTimeout(function () {
-      if (st.popup || st.hovering) return; // keep the frame while the dictionary is open or the mouse is still on the text
+      if (st.hovering || st.overPill) return; // the mouse is still on the text or on the switch above it
+      renderPill();
+      if (st.popup) return; // keep the frame while the dictionary is open
       resumeAfterHover();
     }, 350);
   }
@@ -827,6 +1011,10 @@
     st.popup = null; st.popupWord = null;
     if (st.videoEl) hoverLeave();
   }
+  function runAct(node, stop) { // elements of this script carry their click handler in __ssAct
+    while (node && node !== stop) { if (typeof node.__ssAct === 'function') { node.__ssAct(node); return true; } node = node.parentNode; }
+    return false;
+  }
 
   function showPopup(anchor, q, ctx) {
     closePopup();
@@ -834,18 +1022,43 @@
     var root = st.root || document.body;
     var pop = el('div', 'ss-pop');
     pop.addEventListener('mouseleave', function (e) { if (!cueNodeOf(e.relatedTarget)) closePopup(); });
-    var head = el('div', 'ss-pw', q);
+    var head = el('div', 'ss-pw'), phon = el('span', 'ss-ph'), add = el('span', 'ss-add');
+    head.appendChild(el('span', null, q)); head.appendChild(phon); head.appendChild(add);
     pop.appendChild(head);
     var body = el('div', 'ss-muted', '查询中…');
     pop.appendChild(body);
     root.appendChild(pop);
     st.popup = pop; st.popupWord = q;
     place(pop, anchor, root);
+    // "＋" saves the word with what is known about it here: entry, sentence, film and position.
+    var data = null, at = sentenceStart(), addedHere = false, canSave = /[A-Za-z]/.test(q) && q.length <= 80;
+    if (!st.meta || !st.meta.title) refreshMeta();
+    var entryOf = function () {
+      var d = data || {}, c = d.context || {}, m = st.meta || {};
+      return { word: q, phonetic: d.phonetic || '', entries: d.entries && d.entries.length ? d.entries.slice(0, 6) : (d.web && d.web.length ? [d.web.join('；')] : []),
+        meaning: c.meaning || '', sentence: ctx || '', sentenceZh: c.sentence || '', title: m.title || (okStatus() ? okStatus().title : ''), time: typeof at === 'number' ? at : undefined, video: m.video || undefined };
+    };
+    var paintAdd = function (busyNow) {
+      if (!canSave) { add.style.display = 'none'; return; }
+      var has = inVocab(q);
+      add.className = 'ss-add' + (has ? ' on' : '');
+      add.textContent = busyNow ? '…' : has ? '✓ 已在生词本' : '＋ 生词本';
+      add.title = has ? '点击从生词本移除' : '加入生词本';
+    };
+    add.__ssAct = function () {
+      paintAdd(true);
+      addedHere = !inVocab(q);
+      (addedHere ? vocabAdd(entryOf()) : vocabRemove(q)).then(function () { if (st.popup === pop) paintAdd(false); });
+    };
+    paintAdd(false);
+    ensureVocab().then(function () { if (st.popup === pop) paintAdd(false); });
     var fill = function (d) {
       if (st.popup !== pop) return;
+      data = d;
+      var saved = addedHere ? st.vocab.words[vkey(q)] : null; // saved before this answer arrived: complete the entry
+      if (saved && d && ((!saved.meaning && d.context && d.context.meaning) || (!(saved.entries || []).length && d.entries && d.entries.length))) vocabAdd(entryOf(), true);
       body.textContent = '';
-      head.textContent = q;
-      if (d && d.phonetic) { var ph = el('span', 'ss-ph', '/' + d.phonetic + '/'); head.appendChild(ph); }
+      phon.textContent = d && d.phonetic ? '/' + d.phonetic + '/' : '';
       var got = false;
       if (d && d.entries && d.entries.length) { d.entries.slice(0, 6).forEach(function (t) { body.appendChild(el('div', 'ss-pe', t)); }); got = true; }
       else if (d && d.web && d.web.length) { body.appendChild(el('div', 'ss-pe', d.web.join('；'))); got = true; }
@@ -873,10 +1086,222 @@
     var block = cueNodeOf(anchor), br = block ? block.getBoundingClientRect() : r;
     var w = pop.offsetWidth, h = pop.offsetHeight;
     var left = Math.max(8, Math.min(rr.width - w - 8, r.left - rr.left + r.width / 2 - w / 2));
-    var top = br.top - rr.top - h - 10;
+    var top = br.top - rr.top - h - 10 - (pillVisible() ? st.pill.offsetHeight + 6 : 0);
     if (top < 8) top = br.bottom - rr.top + 10;
     pop.style.left = left + 'px';
     pop.style.top = top + 'px';
+  }
+
+  // ---------- vocabulary book: kept on the server, one per user ----------
+  // The server tells users apart by what the site's login gateway says (when configured) or else by a
+  // random profile id kept in this browser; the id is sent either way, the server knows which one counts.
+
+  function vkey(word) { return String(word || '').replace(/\s+/g, ' ').trim().slice(0, 80).toLowerCase(); }
+  function inVocab(word) { return Boolean(st.vocab.words[vkey(word)]); }
+  function profileId() {
+    var id = null;
+    try { id = localStorage.getItem(LS_PROFILE); } catch (e) { /* private mode */ }
+    if (!id || !/^[A-Za-z0-9_-]{16,64}$/.test(id)) {
+      var bytes = new Uint8Array(24), chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+      (window.crypto || window.msCrypto).getRandomValues(bytes);
+      id = Array.prototype.map.call(bytes, function (b) { return chars[b & 63]; }).join('');
+      try { localStorage.setItem(LS_PROFILE, id); } catch (e) { /* lasts for this page only */ }
+    }
+    return id;
+  }
+  function vocabFetch(method, query, body) {
+    var opts = { method: method, cache: 'no-store', headers: { 'x-subsync-profile': profileId() } };
+    if (body) { opts.headers['content-type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    return fetch(BASE + '/vocab' + (query || ''), opts).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) {
+        if (r.status === 401) throw new Error(j && j.mode === 'profile' ? '无法识别用户' : '登录已过期，请刷新页面重新登录'); // the login gateway answers 401 itself
+        if (!r.ok || !j || !j.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+        return j;
+      });
+    });
+  }
+  function ensureVocab(force) {
+    if (st.vocab.loading) return st.vocab.loading;
+    if (st.vocab.loaded && !force) return Promise.resolve(st.vocab);
+    st.vocab.loading = vocabFetch('GET').then(function (j) {
+      var words = {};
+      (j.words || []).forEach(function (w) { words[vkey(w.word)] = w; });
+      st.vocab.words = words; st.vocab.user = j.user || null; st.vocab.loaded = true; st.vocab.error = '';
+    }).catch(function (e) { st.vocab.error = e.message || '读取失败'; })
+      .then(function () { st.vocab.loading = null; renderPanel(); return st.vocab; });
+    return st.vocab.loading;
+  }
+  function vocabAdd(entry, quiet) {
+    return vocabFetch('POST', '', entry).then(function (j) {
+      st.vocab.words[vkey(j.item.word)] = j.item;
+      if (!quiet) badge('已加入生词本：' + j.item.word);
+      renderPanel();
+    }).catch(function (e) { if (!quiet) toast('加入生词本失败：' + e.message, 'error'); });
+  }
+  function vocabRemove(word) {
+    return vocabFetch('DELETE', '?word=' + encodeURIComponent(vkey(word))).then(function () {
+      delete st.vocab.words[vkey(word)];
+      renderPanel();
+    }).catch(function (e) { toast('移除失败：' + e.message, 'error'); });
+  }
+
+  // What is playing, to note with a saved word and to find the way back to its sentence.
+  function refreshMeta() {
+    var core = window.core;
+    if (!core || typeof core.getState !== 'function') return Promise.resolve(null);
+    var href = location.hash;
+    return Promise.resolve().then(function () { return core.getState('player'); }).then(function (p) {
+      if (!p || location.hash !== href) return st.meta;
+      var item = p.metaItem && p.metaItem.content ? p.metaItem.content : null;
+      var sel = p.selected || {}, path = sel.streamRequest && sel.streamRequest.path ? sel.streamRequest.path : null;
+      var title = item && item.name ? String(item.name) : '';
+      var si = p.seriesInfo;
+      if (title && si && typeof si.season === 'number' && typeof si.episode === 'number') title += ' S' + (si.season < 10 ? '0' : '') + si.season + 'E' + (si.episode < 10 ? '0' : '') + si.episode;
+      var video = { id: path && path.id ? String(path.id) : '', type: path && path.type ? String(path.type) : (item && item.type) || '', metaId: item && item.id ? String(item.id) : '' };
+      if (/^#\/player\//.test(href) && href.length <= 3000) video.href = href;
+      st.meta = { title: title, video: video };
+      renderPanel();
+      return st.meta;
+    }).catch(function () { return st.meta; });
+  }
+  function sentenceStart() { // player time (ms) at which the sentence on screen begins
+    if (st.time === null) return null;
+    var cc = currentCues(), t = st.time - cc.delay, hit = null;
+    cc.cues.forEach(function (c) { if (c.startTime <= t + 150 && t <= c.endTime + 300) hit = c; });
+    return hit ? hit.startTime + cc.delay : st.time;
+  }
+  function sameVideo(item) {
+    var v = item && item.video, m = st.meta && st.meta.video;
+    return Boolean(v && m && v.id && v.id === m.id);
+  }
+  function jumpTo(item) {
+    if (typeof item.time !== 'number') return;
+    if (sameVideo(item)) { seekSentence(item.time); return; }
+    if (!(item.video && item.video.href)) { toast('这句话在另一部片里：' + (item.title || ''), 'info'); return; }
+    st.pendingSeek = { href: item.video.href, time: item.time, at: Date.now() };
+    closePanel();
+    location.hash = item.video.href;
+  }
+  function seekSentence(ms) {
+    st.spDone = null; st.hoverSuppressed = true;
+    st.spWait = null;
+    safeDispatch({ type: 'setProp', propName: 'time', propValue: Math.max(0, Math.round(ms - 60)) });
+    if (st.paused) { st.pausedByHover = false; safeDispatch({ type: 'setProp', propName: 'paused', propValue: false }); }
+  }
+  function applyPendingSeek() { // the other video has loaded: go to the sentence the word came from
+    var ps = st.pendingSeek;
+    if (!ps) return;
+    if (Date.now() - ps.at > 180000) { st.pendingSeek = null; return; }
+    if (location.hash !== ps.href || st.time === null) return;
+    st.pendingSeek = null;
+    setTimeout(function () { seekSentence(ps.time); }, 0);
+  }
+
+  // The button sits with the player's own buttons (it copies their classes for the look); the panel is
+  // an element of ours on the right edge of the player, like the player's episode drawer.
+  var BOOK_ICON = 'M6 2h11a2 2 0 0 1 2 2v14a1 1 0 0 1-1 1H7a1 1 0 0 0 0 2h11a1 1 0 1 1 0 2H7a3 3 0 0 1-3-3V4a2 2 0 0 1 2-2zm3 4a1 1 0 0 0 0 2h6a1 1 0 1 0 0-2H9zm0 4a1 1 0 0 0 0 2h4a1 1 0 1 0 0-2H9z';
+  function ensureVocabButton() {
+    if (!st.video) return;
+    var host = document.querySelector('[class*="control-bar-buttons-menu-container"]');
+    if (!host) return;
+    if (st.vbtn && st.vbtn.parentNode === host) return;
+    var sample = null;
+    for (var i = 0; i < host.children.length; i++) {
+      var c = host.children[i];
+      if (c === st.vbtn || !/control-bar-button/.test(String(c.className))) continue;
+      if (!sample || /(^|\s)disabled(\s|$)/.test(String(sample.className))) sample = c;
+    }
+    if (!sample) return;
+    var b = st.vbtn;
+    if (!b) {
+      b = st.vbtn = el('div');
+      b.addEventListener('click', function (e) { e.stopPropagation(); togglePanel(); });
+      b.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+    }
+    b.className = String(sample.className).split(/\s+/).filter(function (c) { return c && c !== 'disabled' && c !== 'active'; }).concat('ss-vbtn').join(' ');
+    b.title = '生词本'; b.tabIndex = -1;
+    b.textContent = '';
+    var ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg'), path = document.createElementNS(ns, 'path');
+    var sampleSvg = sample.querySelector('svg');
+    if (sampleSvg && sampleSvg.getAttribute('class')) svg.setAttribute('class', sampleSvg.getAttribute('class')); else { svg.style.width = '1.8rem'; svg.style.height = '1.8rem'; }
+    svg.setAttribute('viewBox', '0 0 24 24');
+    path.setAttribute('d', BOOK_ICON); path.setAttribute('fill', 'currentColor');
+    svg.appendChild(path); b.appendChild(svg);
+    host.insertBefore(b, host.firstChild);
+  }
+  function togglePanel() { if (st.panelOpen) closePanel(); else openPanel(); }
+  function closePanel() {
+    st.panelOpen = false;
+    if (st.panel && st.panel.parentNode) st.panel.parentNode.removeChild(st.panel);
+  }
+  function openPanel() {
+    var root = st.root || document.body;
+    if (!st.panel) {
+      st.panel = el('div', 'ss-panel');
+      st.panel.__onlyThis = false;
+      st.panel.addEventListener('mousemove', function (e) { e.immersePrevented = true; }); // keep the controls from hiding under the mouse
+      ['wheel', 'touchstart', 'touchmove', 'touchend', 'contextmenu'].forEach(function (t) { st.panel.addEventListener(t, function (e) { e.stopPropagation(); }, { passive: true }); });
+    }
+    if (st.panel.parentNode !== root) root.appendChild(st.panel);
+    // Stay clear of the control bar: its buttons (this panel's own among them) remain usable.
+    var cb = document.querySelector('[class*="control-bar-container"]'), rr = root.getBoundingClientRect();
+    var gap = cb ? Math.round(rr.bottom - cb.getBoundingClientRect().top) : 0;
+    st.panel.style.bottom = (gap > 0 && gap < rr.height / 2 ? gap : 0) + 'px';
+    st.panelOpen = true;
+    renderPanel();
+    refreshMeta();
+    ensureVocab(true);
+  }
+  function fmtDate(iso) { var m = /^\d{4}-(\d\d)-(\d\d)/.exec(String(iso || '')); return m ? m[1] + '-' + m[2] : ''; }
+  function renderPanel() {
+    var panel = st.panel;
+    if (!panel || !st.panelOpen) return;
+    var scroll = panel.querySelector('.ss-vl'), keep = scroll ? scroll.scrollTop : 0;
+    var all = Object.keys(st.vocab.words).map(function (k) { return st.vocab.words[k]; })
+      .sort(function (a, b) { return String(b.addedAt || '').localeCompare(String(a.addedAt || '')); });
+    var here = all.filter(sameVideo), items = panel.__onlyThis ? here : all;
+    panel.textContent = '';
+    var head = el('div', 'ss-vh');
+    head.appendChild(el('span', 'ss-vt', '生词本'));
+    head.appendChild(el('span', 'ss-muted', all.length + ' 个' + (st.vocab.user && st.vocab.user.name ? ' · ' + st.vocab.user.name : '')));
+    var x = el('span', 'ss-vx', '×'); x.title = '关闭（Esc）'; x.__ssAct = closePanel;
+    head.appendChild(x);
+    panel.appendChild(head);
+    var tabs = el('div', 'ss-vtabs');
+    [['全部 ' + all.length, false], ['本片 ' + here.length, true]].forEach(function (t) {
+      var tab = el('span', 'ss-vtab' + (panel.__onlyThis === t[1] ? ' on' : ''), t[0]);
+      tab.__ssAct = function () { panel.__onlyThis = t[1]; renderPanel(); };
+      tabs.appendChild(tab);
+    });
+    panel.appendChild(tabs);
+    var list = el('div', 'ss-vl');
+    if (st.vocab.error) list.appendChild(el('div', 'ss-muted', '读取生词本失败：' + st.vocab.error));
+    else if (!st.vocab.loaded) list.appendChild(el('div', 'ss-muted', '读取中…'));
+    else if (!items.length) list.appendChild(el('div', 'ss-muted', panel.__onlyThis ? '这部片还没有生词。' : '还没有生词。点字幕里的单词，在弹出的释义里按「＋ 生词本」。'));
+    items.forEach(function (w) {
+      var it = el('div', 'ss-vi');
+      var top = el('div'); top.appendChild(el('span', 'ss-vw', w.word));
+      if (w.phonetic) top.appendChild(el('span', 'ss-ph', '/' + w.phonetic + '/'));
+      it.appendChild(top);
+      var del = el('span', 'ss-vd', '×'); del.title = '从生词本移除';
+      del.__ssAct = function () { vocabRemove(w.word); };
+      it.appendChild(del);
+      (w.entries || []).slice(0, 4).forEach(function (t) { it.appendChild(el('div', 'ss-pe', t)); });
+      if (w.meaning) { var m = el('div', 'ss-pe'); m.appendChild(el('span', 'ss-pl', '句中')); m.appendChild(document.createTextNode(w.meaning)); it.appendChild(m); }
+      if (w.sentence) {
+        var can = typeof w.time === 'number' && (sameVideo(w) || Boolean(w.video && w.video.href));
+        var sen = el('div', 'ss-vs' + (can ? ' go' : ''));
+        sen.appendChild(el('div', null, (can ? '▶ ' : '') + w.sentence));
+        if (w.sentenceZh) sen.appendChild(el('div', 'ss-vz', w.sentenceZh));
+        if (can) { sen.title = sameVideo(w) ? '跳到这句话' : '打开这部片并跳到这句话'; sen.__ssAct = function () { jumpTo(w); }; }
+        it.appendChild(sen);
+      }
+      var metaLine = [w.title || '', typeof w.time === 'number' ? fmtTime(w.time / 1000) : '', fmtDate(w.addedAt)].filter(Boolean).join(' · ');
+      if (metaLine) it.appendChild(el('div', 'ss-vm', metaLine));
+      list.appendChild(it);
+    });
+    panel.appendChild(list);
+    list.scrollTop = keep;
   }
 
   function wordTarget(e) {
@@ -885,7 +1310,7 @@
   }
   ['mousedown', 'mouseup', 'dblclick'].forEach(function (type) {
     window.addEventListener(type, function (e) {
-      if (wordTarget(e) || inPopup(e.target)) e.stopImmediatePropagation();
+      if (wordTarget(e) || inPopup(e.target) || inPill(e.target) || inPanel(e.target)) e.stopImmediatePropagation();
       if (type === 'mouseup' && containerOf(e.target)) {
         var sel = window.getSelection ? String(window.getSelection()).replace(/\s+/g, ' ').trim() : '';
         if (sel && /\s/.test(sel) && sel.length <= 200) {
@@ -904,7 +1329,9 @@
       showPopup(w, w.textContent, sentenceOf(cueNodeOf(w)));
       return;
     }
-    if (inPopup(e.target)) { e.stopImmediatePropagation(); return; }
+    if (inPopup(e.target)) { e.stopImmediatePropagation(); runAct(e.target, st.popup); return; }
+    if (inPill(e.target)) { e.stopImmediatePropagation(); runAct(e.target, st.pill); return; }
+    if (inPanel(e.target)) { e.stopImmediatePropagation(); runAct(e.target, st.panel); return; }
     if (st.popup) closePopup();
   }, true);
 })();

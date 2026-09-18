@@ -15,6 +15,7 @@ const { execFile } = require('child_process');
 const { align, cueMatch, speechFromRms, parseSrt, formatSrt } = require('./align');
 const translate = require('./translate');
 const dict = require('./dict');
+const vocab = require('./vocab');
 
 const PORT = Number(process.env.PORT || 11480);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -63,7 +64,7 @@ if (!TOKEN || !PUBLIC_BASE) {
 
 const MANIFEST = {
   id: 'com.tokencv.subsync',
-  version: '1.2.0',
+  version: '1.3.0',
   name: '字幕对齐',
   description: 'OpenSubtitles 字幕：按需对齐时间轴并排序，提供中英双语与 AI 翻译中文字幕（对齐和翻译都由用户触发）',
   resources: ['subtitles'],
@@ -746,6 +747,32 @@ async function handleAction(req, res, shortKey) {
   send(res, 200, statusOf(job));
 }
 
+// ---------- vocabulary book (web UI) ----------
+
+// GET lists the user's words, POST adds one (or completes it), DELETE ?word= removes one. The user comes
+// from the reverse proxy or from the browser's profile id (see vocab.js); without one the answer is 401.
+async function handleVocab(req, res, url) {
+  const user = vocab.userOf(req, url, CACHE_DIR);
+  if (!user) return send(res, 401, { error: 'unknown user', mode: vocab.mode() });
+  const who = { name: user.name || '', verified: user.verified };
+  if (req.method === 'GET') return send(res, 200, { ok: true, user: who, words: await vocab.list(CACHE_DIR, user) });
+  if (req.method === 'POST') {
+    if (Number(req.headers['content-length']) > 16384) return send(res, 413, { error: 'body too large' });
+    let body = {};
+    try { body = JSON.parse((await readBody(req, 16384)) || '{}'); } catch (_) { return send(res, 400, { error: 'bad json' }); }
+    const out = await vocab.add(CACHE_DIR, user, body);
+    if (out.error) return send(res, 400, out);
+    if (out.created) log('vocab add', `${out.count} words`);
+    return send(res, 200, { ok: true, user: who, ...out });
+  }
+  if (req.method === 'DELETE') {
+    const out = await vocab.remove(CACHE_DIR, user, url.searchParams.get('word') || '');
+    if (out.error) return send(res, 400, out);
+    return send(res, 200, { ok: true, user: who, ...out });
+  }
+  send(res, 405, { error: 'method not allowed' });
+}
+
 // ---------- HTTP plumbing ----------
 
 // The streaming engine fetches subtitle files with a 10 s timeout that is cleared once response headers
@@ -761,8 +788,8 @@ function send(res, code, body, type) {
   res.writeHead(code, {
     'content-type': type || (isText ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8'),
     'access-control-allow-origin': '*',
-    'access-control-allow-headers': 'content-type',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, x-subsync-profile',
+    'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
     'cache-control': 'no-store',
   });
   res.end(isText ? body : JSON.stringify(body));
@@ -773,7 +800,7 @@ http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const parts = url.pathname.split('/').filter(Boolean);
     if (req.method === 'OPTIONS') return send(res, 204, '');
-    if (parts[0] === 'health') return send(res, 200, { ok: true, version: MANIFEST.version, jobs: jobs.size, translation: translate.enabled() ? translate.MODEL : false });
+    if (parts[0] === 'health') return send(res, 200, { ok: true, version: MANIFEST.version, jobs: jobs.size, translation: translate.enabled() ? translate.MODEL : false, vocab: vocab.mode() });
     if (parts[0] !== TOKEN) return send(res, 404, 'not found');
     const rest = parts.slice(1);
     if (rest[0] === 'manifest.json') return send(res, 200, MANIFEST);
@@ -790,6 +817,7 @@ http.createServer(async (req, res) => {
       return job ? send(res, 200, statusOf(job)) : send(res, 404, { error: 'unknown video' });
     }
     if (rest[0] === 'action' && rest.length === 2 && req.method === 'POST') return await handleAction(req, res, rest[1]);
+    if (rest[0] === 'vocab' && rest.length === 1) return await handleVocab(req, res, url);
     if (rest[0] === 'dict') {
       const q = (url.searchParams.get('q') || '').trim().slice(0, 200);
       const ctx = (url.searchParams.get('ctx') || '').trim().slice(0, 600);

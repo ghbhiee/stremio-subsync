@@ -15,7 +15,9 @@ A self-hosted Stremio subtitles addon that aligns OpenSubtitles subtitles to the
 - **不打断播放**：对齐、翻译都在后台跑，期间照常看（先用原始字幕）；完成后右上角弹通知，并把当前字幕换成对齐/翻译好的版本（播放器不能删字幕条目，被换掉的旧条目由脚本在菜单里隐藏，每条字幕只显示最新的一份）。如果发现正在看的字幕和视频不匹配而另一条匹配，会自动切到最佳的那条并提示。
 - **英文第一、中文第二**：语言列表固定这个顺序，界面语言不用改。
 - **点词查词**：鼠标停在字幕上自动暂停（可关），点英文单词弹出有道词典释义（音标、词性、中文），配置了翻译模型时再补一行「这句话里的意思」和整句翻译；拖选多个词可以查短语。片源**内嵌的文字字幕**同样支持：脚本用 `video::cue` 隐藏浏览器的原生渲染，把当前字幕按播放器的样式自己画出来。
-- **逐句快捷键**：显示字幕时（插件字幕或内嵌字幕都行）`A` 回到上一句、`S` 重听本句、`D` 下一句（没有字幕时这三个键保持 Stremio 原来的功能）。
+- **逐句快捷键**：显示字幕时（插件字幕或内嵌字幕都行）`A` 回到上一句、`S` 重听本句、`D` 下一句（没有字幕时这三个键保持 Stremio 原来的功能）；`E` 播放/暂停。
+- **逐句暂停（精听）**：按 `Q` 打开后，每句字幕快播完时自动停住（停在句末前一点，字幕还留在屏幕上，可以继续点词），学完按 `D` 进入下一句，`S` 重听、`A` 上一句、`E` 直接继续。开关显示在两处：鼠标停在字幕上时字幕上方的小浮层（停住时浮层里还有可点的 A/S/D/E，平板没有键盘也能用），以及字幕菜单上方的工具条。状态记在浏览器里。
+- **生词本**：点词弹窗右上角的「＋ 生词本」把单词连同音标、释义、句中意思、所在句子、片名和时间点一起保存；已保存的显示「✓ 已在生词本」，再点一次移除。播放器底部控制条多一个书本图标，点开后在右侧列出全部生词（可切换「全部 / 本片」、删除），点例句跳回那句话（不是当前影片时会先打开那部片）。**生词本存在服务器上、按用户分开**，见下面的「生词本的用户」。
 - **原生客户端兜底**：没有注入脚本的 Stremio 客户端（Mac、手机、电视）在英文列表末尾能看到「▶ 对齐全部字幕」、中文列表末尾能看到「▶ 生成 AI 中文字幕」，选中即开始，稍后重新选一次字幕就能拿到结果。
 - **自动预装（可选）**：自托管 stremio-web 时，注入脚本自动装好 Torrentio、MediaFusion 和本插件，并卸掉被本插件替代的 OpenSubtitles v3。
 
@@ -69,11 +71,21 @@ sudo PUBLIC_BASE=https://media.example.com/subsync \
 - `PUBLIC_BASE`（必填）：插件对外的地址前缀，路径部分会成为 nginx 的 location。
 - `DEEPSEEK_API_KEY`：填了才启用 AI 翻译和语境释义，保存在 `/etc/stremio/subsync.env`（权限 640），不会打印。
 - `NGINX_SNIPPET`：一个已被 HTTPS server 块 include 的 nginx 文件，脚本会追加 `examples/nginx-subsync.conf` 并在 `nginx -t` 通过后 reload。不填就手动把示例加进你的配置。
-- `WEB_DIR`：自托管 stremio-web 的目录，填了才把预装脚本和播放器脚本（`subsync-ui.js`）挂进 `index.html`。不填也能用插件本身，只是没有开关、通知、查词和快捷键。
+- `WEB_DIR`：自托管 stremio-web 的目录，填了才把预装脚本和播放器脚本（`subsync-ui.js`）挂进 `index.html`。不填也能用插件本身，只是没有开关、通知、查词、快捷键和生词本。
+- `VOCAB_USER_HEADER`（可选）：你的登录网关通过反向代理传来的「当前用户」请求头名，见下一节。
 
 装好后，在 Stremio 的 Addons 页面安装 `PUBLIC_BASE/<SUBSYNC_TOKEN>/manifest.json`，token 在 `/etc/stremio/subsync.env` 里。**这个地址本身就是访问凭证，不要公开。** 其余配置项见 `examples/subsync.env.example`。
 
 升级：`git pull` 后用同样的命令再跑一次 `deploy.sh`（幂等，已有的 token 和 key 保留）。
+
+### 生词本的用户
+
+插件地址里只有一个共享的 token，分不出是谁，所以「用户」有两种来源（`/health` 的 `vocab` 字段显示当前是哪种）：
+
+- **默认（`profile`）**：浏览器第一次用生词本时生成一个随机 ID 存在 localStorage，随请求带上，服务器按它分文件保存。不用任何配置；ID 猜不到，所以互相读写不了。缺点是一个浏览器一本，换设备或清掉浏览器数据就是另一本（旧文件还在服务器上）。
+- **登录网关（`header`）**：站点前面有登录网关（nginx `auth_request`、Authelia、oauth2-proxy……）时，让反向代理校验登录后把用户名放进一个请求头，并设置 `VOCAB_USER_HEADER=<头名>`。此时没有这个头的请求一律 401，浏览器自报的 ID 不再起作用，同一个人在不同设备上是同一本。nginx 写法见 `examples/nginx-subsync.conf`：给 `/subsync/<token>/vocab` 单独一个带 `auth_request` 的 location，并在普通的 `/subsync/` location 里把这个头清空，防止客户端伪造。`VOCAB_NAME_HEADER` 可再传一个显示名（URL 编码）。
+
+数据在 `<CACHE_DIR>/vocab/`，每个用户一个 JSON 文件（文件名是用户 ID 的哈希，权限 600）。同一个人有多个 ID 时，在 `<CACHE_DIR>/vocab/aliases.json` 里写 `{"p:1": "dad", "p:3": "dad"}`（`p:` 是网关给的 ID，`c:` 是浏览器 ID），它们就共用 `dad` 这一本，各自原来的生词在第一次访问时自动并入。
 
 ## 接口（供二次开发）
 
@@ -86,6 +98,7 @@ sudo PUBLIC_BASE=https://media.example.com/subsync \
 | `status/<video>` | 对齐、翻译进度和每条字幕的结果 |
 | `action/<video>`（POST JSON） | `{"align":true}`、`{"translate":true}`、`{"bilingual":true}`（对齐 + 翻译）、加 `"force":true` 用当前最佳英文重新翻译 |
 | `dict?q=<词>&ctx=<句子>` | 查词 |
+| `vocab` | 生词本：`GET` 列出当前用户的生词；`POST` JSON `{word, phonetic, entries[], meaning, sentence, sentenceZh, title, time, video{id,type,metaId,href}}` 添加（同一个词再次提交是补全）；`DELETE ?word=<词>` 移除。用户来自 `VOCAB_USER_HEADER` 指定的头，或请求头 `X-Subsync-Profile`（16–64 位字母数字），都没有则 401 |
 
 `<video>` 是列表里字幕 URL 中的 16 位视频键。
 

@@ -7,6 +7,10 @@
 #   WEB_DIR           self-hosted stremio-web directory: installs the preinstall hook and the subtitle UI
 #                     script (subsync-ui.js) into index.html
 #   NGINX_SNIPPET     nginx file included inside your HTTPS server block: the proxy location is added to it
+#   VOCAB_USER_HEADER request header in which your reverse proxy names the logged-in user; the vocabulary
+#                     book is then kept per user of your login gateway (see examples/nginx-subsync.conf).
+#                     Without it each browser gets its own book.
+#   VOCAB_NAME_HEADER optional header with a display name for that user (percent-encoded)
 #   SERVICE_USER      user the addon runs as (default: stremio)
 #   NODE_BIN          node >= 20 (default: node in PATH, else /opt/stremio-node/bin/node)
 set -euo pipefail
@@ -33,14 +37,16 @@ id "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --user-group --no-create-
 
 echo "== code"
 install -d $APP
-install -m644 "$S/server.js" "$S/align.js" "$S/translate.js" "$S/dict.js" $APP/
-for f in server.js align.js translate.js dict.js; do "$NODE_BIN" --check $APP/$f; done
+install -m644 "$S/server.js" "$S/align.js" "$S/translate.js" "$S/dict.js" "$S/vocab.js" $APP/
+for f in server.js align.js translate.js dict.js vocab.js; do "$NODE_BIN" --check $APP/$f; done
 
 echo "== env file"
 install -d /etc/stremio
 [ -f $ENV_FILE ] || printf 'SUBSYNC_TOKEN=%s\n' "$(openssl rand -hex 16)" > $ENV_FILE
 set_env PUBLIC_BASE "$PUBLIC_BASE"
 [ -n "${DEEPSEEK_API_KEY:-}" ] && set_env DEEPSEEK_API_KEY "$DEEPSEEK_API_KEY"
+[ -n "${VOCAB_USER_HEADER:-}" ] && set_env VOCAB_USER_HEADER "$VOCAB_USER_HEADER"
+[ -n "${VOCAB_NAME_HEADER:-}" ] && set_env VOCAB_NAME_HEADER "$VOCAB_NAME_HEADER"
 chown root:"$SERVICE_USER" $ENV_FILE && chmod 640 $ENV_FILE
 TOKEN=$(sed -n 's/^SUBSYNC_TOKEN=//p' $ENV_FILE)
 MANIFEST="$PUBLIC_BASE/$TOKEN/manifest.json"
