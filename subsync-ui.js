@@ -1,6 +1,6 @@
 // Web UI for the 字幕对齐 (stremio-subsync) addon, injected into a self-hosted stremio-web.
-// It attaches a bar above the player's subtitles menu (bilingual switch, "generate AI Chinese subtitle"
-// and "align" buttons, live progress) and shows notifications when the work finishes (the finished
+// It attaches a bar above the player's subtitles menu ("generate AI Chinese subtitle" / download and
+// "align" buttons, live progress, the sentence-pause switch with a legend of the keys) and shows notifications when the work finishes (the finished
 // subtitle is then loaded without interrupting playback). It also keeps English first and Chinese
 // second in the language list, maps A/S/D to previous / repeat / next sentence, E to play / pause and Q
 // to "pause after every sentence", pauses while the mouse rests on the subtitle and shows a Chinese
@@ -17,7 +17,7 @@
   var SUB_RE = /\/sub\/([0-9a-f]{16})\/([^/?#]+)\.srt(?:\?([^#]*))?$/;
   var CHI = { chi: 1, zho: 1, zht: 1, zhs: 1, chs: 1, cht: 1, ze: 1, zh: 1 };
   var TRAD = '繁体中文'; // the addon lists Traditional Chinese as a language of its own, named like this
-  var LS_BI = 'subsync.bilingual', LS_HOVER = 'subsync.hoverPause', LS_SP = 'subsync.sentencePause', LS_PROFILE = 'subsync.profile';
+  var LS_BI = 'subsync.bilingual', LS_HOVER = 'subsync.hoverPause', LS_SP = 'subsync.sentencePause', LS_PROFILE = 'subsync.profile', LS_VOICE = 'subsync.voice';
   var POLL_MS = 2500;
   var SP_MARGIN = 120; // sentence pause stops this many ms before the cue ends, so its text stays on screen
   var ORIGIN = '字幕对齐';
@@ -31,7 +31,7 @@
     pausedByHover: false, hovering: false, hoverTimer: null, popup: null, popupWord: null,
     menuObserver: null, videoObserver: null, bar: null, barKey: '', wantMt: false, wantBi: false, biApplied: false, internalSelect: false,
     embeddedId: null, embTrack: null, embEl: null,
-    timeOffset: 0, spTimer: null, spDone: null, spWait: null, pausedBySentence: false, hoverSuppressed: false, pill: null, pillKey: '', overPill: false,
+    timeOffset: 0, spTimer: null, spDone: null, spWait: null, pausedBySentence: false, hoverSuppressed: false,
     meta: null, pendingSeek: null, vbtn: null, panel: null, panelOpen: false,
     vocab: { loaded: false, loading: null, words: {}, user: null, error: '' },
     embStyle: { size: 100, offset: 0, offsetMin: 0, color: 'rgb(255, 255, 255)', bg: 'rgba(0, 0, 0, 0)', outline: 'rgb(34, 34, 34)' },
@@ -101,6 +101,7 @@
     '.ss-pop .ss-pe{margin-top:.2rem}.ss-pop .ss-pc{margin-top:.4rem;padding-top:.4rem;border-top:1px solid rgba(255,255,255,.15)}',
     '.ss-pop .ss-pl{opacity:.6;font-size:.8rem;margin-right:.3rem}',
     '.ss-pop .ss-pw{display:flex;align-items:baseline;flex-wrap:wrap;gap:0 .2rem}',
+    '.ss-say{cursor:pointer;margin-left:.4rem;font-size:1rem;font-weight:400;opacity:.8;align-self:center}.ss-say:hover{opacity:1}',
     '.ss-add{margin-left:auto;flex:none;align-self:center;cursor:pointer;padding:.15rem .55rem;border-radius:1rem;border:1px solid rgba(255,255,255,.4);background:transparent;color:inherit;font:inherit;font-size:.8rem;font-weight:400;white-space:nowrap}',
     '.ss-add:hover{background:rgba(255,255,255,.15)}.ss-add.on{border-color:transparent;background:var(--secondary-accent-color,#7b5bf5);color:#fff}',
     '.ss-vbtn svg{fill:currentColor}',
@@ -113,9 +114,8 @@
     '.ss-vi .ss-vd{position:absolute;top:.6rem;right:0;cursor:pointer;opacity:.45;font-size:1.1rem;padding:0 .3rem}.ss-vi .ss-vd:hover{opacity:1}',
     '.ss-vi .ss-vs{margin-top:.35rem;padding:.35rem .55rem;border-radius:.4rem;background:rgba(255,255,255,.07)}.ss-vi .ss-vs.go{cursor:pointer}.ss-vi .ss-vs.go:hover{background:rgba(255,255,255,.14)}',
     '.ss-vi .ss-vz{opacity:.75;font-size:.88rem}.ss-vi .ss-vm{margin-top:.3rem;opacity:.55;font-size:.8rem}',
+    '.ss-keys{flex-wrap:wrap;gap:.3rem .5rem}.ss-key{display:flex;align-items:center;gap:.3rem;cursor:pointer;padding:.1rem .5rem .1rem .25rem;border-radius:1rem;background:rgba(255,255,255,.1);font-size:.85rem}.ss-key:hover{background:rgba(255,255,255,.22)}',
     '.ss-kbd{flex:none;padding:0 .4rem;border:1px solid rgba(255,255,255,.45);border-radius:.3rem;font-size:.8rem;line-height:1.35;opacity:.9}',
-    '.ss-key{display:flex;align-items:center;gap:.3rem;cursor:pointer;padding:.1rem .45rem;border-radius:1rem;background:rgba(255,255,255,.12)}.ss-key:hover{background:rgba(255,255,255,.25)}',
-    '.ss-pill{position:absolute;z-index:44;display:flex;align-items:center;gap:.5rem;padding:.3rem .8rem;border-radius:2rem;background:var(--modal-background-color,rgba(16,16,28,.92));backdrop-filter:blur(12px);box-shadow:0 .4rem 1rem rgba(0,0,0,.4);color:var(--primary-foreground-color,#fff);font-size:.9rem;line-height:1.4;white-space:nowrap;text-shadow:none;user-select:none}',
   ].join('\n');
   var styleEl = el('style'); styleEl.textContent = css; (document.head || document.documentElement).appendChild(styleEl);
 
@@ -161,7 +161,6 @@
         if (value === false && st.pausedByHover) st.pausedByHover = false; // the user resumed by hand
         st.paused = value;
         if (value === false) { st.pausedBySentence = false; armSentencePause(); } else disarmSentencePause();
-        renderPill();
         break;
       }
       case 'extraSubtitlesDelay': st.delay = typeof value === 'number' ? value : 0; break;
@@ -208,8 +207,7 @@
     if (st.embEl && st.embEl.parentNode) st.embEl.parentNode.removeChild(st.embEl);
     removeBar();
     closePanel();
-    if (st.pill && st.pill.parentNode) st.pill.parentNode.removeChild(st.pill);
-    st.pill = null; st.pillKey = ''; st.vbtn = null; st.hovering = false; st.overPill = false;
+    st.vbtn = null; st.hovering = false;
     st.video = null; st.videoEl = null; st.subsEl = null; st.embTrack = null; st.embEl = null; st.embeddedId = null;
     if (st.menuObserver) { st.menuObserver.disconnect(); st.menuObserver = null; }
     if (st.videoObserver) { st.videoObserver.disconnect(); st.videoObserver = null; }
@@ -224,7 +222,6 @@
     st.preview = []; st.pausedByHover = false; st.barKey = '';
     disarmSentencePause(); st.spDone = null; st.spWait = null; st.pausedBySentence = false; st.meta = null;
     closePopup();
-    renderPill();
   }
 
   setInterval(function () {
@@ -399,21 +396,6 @@
     toast('正在生成 AI 中文字幕并对齐，完成后自动切换为中英双语', 'info', 8000);
   }
 
-  function bilingualOff() {
-    var p = mine(selectedTrack()), s = okStatus(), t = null;
-    st.wantBi = false;
-    if (!isBilingual(p)) return;
-    if (p.key === 'mt') {
-      t = newestTrack('mt');
-      if (t) select(t.id); else addLive('mt', false, 'chi');
-      return;
-    }
-    var human = humanChinese();
-    if (s && s.best.zh) human.forEach(function (h) { if (!t && h.p.key === s.best.zh) t = newestTrack(h.p.key) || h.t; });
-    if (!t && human.length) t = newestTrack(human[0].p.key) || human[0].t;
-    if (t) select(t.id);
-  }
-
   function sigFor(p) { return identity(p) + '|' + st.alignEpoch + '|' + (p.key === 'mt' ? st.mtEpoch : 0); }
 
   function translateReady(s) {
@@ -512,7 +494,7 @@
   function scheduleMenu() { // setTimeout, not requestAnimationFrame: the latter stops in a background tab
     if (menuScheduled) return;
     menuScheduled = true;
-    setTimeout(function () { menuScheduled = false; ensureVocabButton(); if (pillVisible()) renderPill(); renderMenu(); }, 30);
+    setTimeout(function () { menuScheduled = false; ensureVocabButton(); renderMenu(); }, 30);
   }
   window.addEventListener('resize', scheduleMenu);
   function findMenu() {
@@ -611,30 +593,27 @@
     var bar = st.bar;
     if (!bar || !bar.parentNode) return;
     var s = st.status, p = mine(selectedTrack());
-    var biNow = isBilingual(p), hover = pref(LS_HOVER, true), sp = spOn;
+    var biNow = isBilingual(p), hover = pref(LS_HOVER, true), sp = spOn, voiceOn = pref(LS_VOICE, true);
     var key = JSON.stringify([st.shortKey, !s ? null : s.missing ? 'missing' : [s.align.state, s.align.running, s.align.phase, s.align.done, s.align.total, s.align.error,
-      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, sp, st.selectedId, st.embeddedId, st.wantBi]);
+      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, sp, voiceOn, st.selectedId, st.embeddedId, st.wantBi]);
     if (key === st.barKey) return; // nothing changed: leave the DOM alone (the menu observer would loop otherwise)
     st.barKey = key;
     bar.textContent = '';
     if (st.shortKey) {
-      var sw = el('div', 'ss-sw' + (biNow || st.wantBi ? ' on' : ''));
-      sw.addEventListener('click', function () {
-        var on = !(isBilingual(mine(selectedTrack())) || st.wantBi);
-        setPref(LS_BI, on);
-        if (on) bilingualOn(true); else bilingualOff();
-        renderBar();
-      });
-      bar.appendChild(cell(sw, el('span', 'ss-title', '中英双语')));
       if (s && s.missing) bar.appendChild(cell(el('span', 'ss-muted', '服务已重启，请重新打开视频')));
       else if (s) {
         var ts = s.translate.state, a = s.align;
         if (s.translate.enabled && s.hasEng) {
-          if (ts === 'idle') bar.appendChild(cell(button('生成 AI 中文字幕', function () { st.wantMt = true; st.wantBi = false; postAction({ translate: true }); })));
+          // the last entry picked by hand says whether this viewer reads Chinese alone or under the English
+          if (ts === 'idle') bar.appendChild(cell(button('生成 AI 中文字幕', function () { st.wantMt = true; st.wantBi = pref(LS_BI, false); postAction({ translate: true }); })));
           else if (ts === 'waiting-align') bar.appendChild(cell(el('span', null, 'AI 中文字幕：等待对齐后开始…')));
           else if (ts === 'running') bar.appendChild(cell(el('span', null, 'AI 中文字幕生成中 ' + s.translate.done + '/' + s.translate.total)));
           else if (ts === 'failed') bar.appendChild(cell(el('span', null, 'AI 中文字幕失败：' + (s.translate.error || '')), button('重试', function () { st.wantMt = true; postAction({ translate: true }); })));
-          else if (ts === 'done' && s.translate.stale) bar.appendChild(cell(el('span', null, 'AI 字幕的源字幕与视频不匹配'), button('用最佳英文重新生成', function () { st.wantMt = true; st.wantBi = isBilingual(mine(selectedTrack())); postAction({ translate: true, force: true }); })));
+          else if (ts === 'done') {
+            if (s.translate.stale) bar.appendChild(cell(el('span', null, 'AI 字幕的源字幕与视频不匹配'), button('用最佳英文重新生成', function () { st.wantMt = true; st.wantBi = isBilingual(mine(selectedTrack())); postAction({ translate: true, force: true }); })));
+            var dl = button('下载中英字幕', downloadBilingual); dl.title = '保存为 .srt 文件：每句英文在上、AI 中文在下';
+            bar.appendChild(cell(dl));
+          }
         }
         if (a.running || a.state === 'running') bar.appendChild(cell(el('span', null, alignProgress(a))));
         else if (a.state === 'idle') bar.appendChild(cell(button('开始对齐', function () { postAction({ align: true }); })));
@@ -647,16 +626,39 @@
         }
       }
     }
+    // Sentence pause: whether it is on, and what every key does (the keys can be clicked too: tablets).
     var spSw = el('div', 'ss-sw' + (sp ? ' on' : ''));
     spSw.addEventListener('click', function () { setSentencePause(!spOn, false); });
-    bar.appendChild(cell(spSw, el('span', 'ss-title', '逐句暂停'), el('span', 'ss-kbd', 'Q'), el('span', 'ss-muted', '按 Q 开关，停住后按 D 下一句')));
-    var chk = el('label', 'ss-chk');
-    var input = el('input'); input.type = 'checkbox'; input.checked = hover;
-    input.addEventListener('change', function () { setPref(LS_HOVER, input.checked); renderBar(); });
-    chk.appendChild(input);
-    chk.appendChild(el('span', null, '悬停字幕暂停'));
-    bar.appendChild(chk);
-    bar.appendChild(el('span', 'ss-muted', 'A/S/D 上一句/重听/下一句 · E 播放/暂停 · 点单词查词，＋ 加入生词本'));
+    bar.appendChild(cell(spSw, el('span', 'ss-title', '逐句暂停：' + (sp ? '已开启' : '已关闭')), el('span', 'ss-muted', sp ? '每句播完自动停住' : '')));
+    var keys = el('div', 'ss-cell ss-keys');
+    [['Q', '开/关逐句暂停', function () { setSentencePause(!spOn, false); }], ['D', '下一句', function () { navigate(1); }], ['S', '重听本句', function () { navigate(0); }],
+      ['A', '上一句', function () { navigate(-1); }], ['E', '播放/暂停', togglePlay]].forEach(function (k) {
+      var b = el('span', 'ss-key'); b.appendChild(el('span', 'ss-kbd', k[0])); b.appendChild(document.createTextNode(k[1]));
+      b.addEventListener('click', k[2]);
+      keys.appendChild(b);
+    });
+    bar.appendChild(keys);
+    function check(label, key, on) {
+      var chk = el('label', 'ss-chk'), input = el('input');
+      input.type = 'checkbox'; input.checked = on;
+      input.addEventListener('change', function () { setPref(key, input.checked); renderBar(); });
+      chk.appendChild(input); chk.appendChild(el('span', null, label));
+      return chk;
+    }
+    bar.appendChild(check('悬停字幕暂停', LS_HOVER, hover));
+    bar.appendChild(check('点词发音', LS_VOICE, voiceOn));
+    bar.appendChild(el('span', 'ss-muted', '点单词查词，弹窗里「＋ 生词本」收藏'));
+  }
+
+  function downloadBilingual() { // the AI translation under the English lines, as a file (the server names it after the video)
+    if (!st.shortKey) return;
+    var a = el('a');
+    a.href = BASE + '/sub/' + st.shortKey + '/mt.srt?bi=1&dl=1';
+    a.setAttribute('download', '');
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { if (a.parentNode) a.parentNode.removeChild(a); }, 1000);
   }
 
   // ---------- A / S / D: previous sentence, repeat, next sentence ----------
@@ -747,7 +749,6 @@
     st.spDone = null; st.spWait = null;
     if (on) armSentencePause(); else { disarmSentencePause(); st.pausedBySentence = false; }
     if (announce) badge(on ? '逐句暂停：开（D 下一句）' : '逐句暂停：关');
-    renderPill();
     renderBar();
   }
   function disarmSentencePause() { if (st.spTimer) { clearTimeout(st.spTimer); st.spTimer = null; } }
@@ -781,69 +782,10 @@
       st.spDone = cues[idx].startTime; st.spWait = null;
       st.pausedBySentence = true; st.pausedByHover = false;
       safeDispatch({ type: 'setProp', propName: 'paused', propValue: true });
-      renderPill();
       return;
     }
     st.spWait = cues[idx].startTime;
     st.spTimer = setTimeout(sentenceTick, Math.min(wait, 500));
-  }
-
-  // The switch shows next to the subtitle while the mouse is on it, and while playback waits at the
-  // end of a sentence (with the keys that go on from there).
-  function cuesRect() {
-    var hosts = [st.subsEl, st.embEl], rect = null;
-    hosts.forEach(function (h) {
-      if (!h) return;
-      for (var i = 0; i < h.children.length; i++) {
-        var c = h.children[i];
-        if (c.tagName === 'BR' || !c.offsetHeight) continue;
-        var r = c.getBoundingClientRect();
-        rect = rect ? { top: Math.min(rect.top, r.top), left: Math.min(rect.left, r.left), right: Math.max(rect.right, r.right) } : { top: r.top, left: r.left, right: r.right };
-      }
-    });
-    return rect;
-  }
-  function pillVisible() { return Boolean(st.pill && st.pill.style.display !== 'none' && st.pill.parentNode); }
-  function renderPill() {
-    if (st.hovering && !cuesRect()) st.hovering = false; // the cue under the mouse is gone (no mouseout for removed nodes)
-    var show = Boolean(st.video && st.videoEl && (st.hovering || st.overPill || st.pausedBySentence));
-    if (!show) {
-      if (st.pill && st.pill.style.display !== 'none') { st.pill.style.display = 'none'; st.pillKey = ''; }
-      return;
-    }
-    var root = st.root || document.body, on = spOn;
-    if (!st.pill) {
-      st.pill = el('div', 'ss-pill');
-      st.pill.addEventListener('mouseenter', function () { st.overPill = true; clearTimeout(st.hoverTimer); });
-      st.pill.addEventListener('mouseleave', function (e) { st.overPill = false; if (!cueNodeOf(e.relatedTarget) && !inPopup(e.relatedTarget)) hoverLeave(); });
-      st.pill.addEventListener('mousemove', function (e) { e.immersePrevented = true; });
-    }
-    if (st.pill.parentNode !== root) root.appendChild(st.pill);
-    var key = (on ? '1' : '0') + (st.pausedBySentence ? 'p' : '');
-    if (key !== st.pillKey) {
-      st.pillKey = key;
-      st.pill.textContent = '';
-      var sw = el('span', 'ss-sw' + (on ? ' on' : ''));
-      var toggle = function () { setSentencePause(!spOn, false); };
-      sw.__ssAct = toggle;
-      var label = el('span', 'ss-title', '逐句暂停'); label.__ssAct = toggle; label.style.cursor = 'pointer';
-      st.pill.appendChild(sw); st.pill.appendChild(label);
-      st.pill.appendChild(el('span', 'ss-kbd', 'Q'));
-      st.pill.appendChild(el('span', 'ss-muted', on ? '按 Q 开关 · 每句播完自动停' : '按 Q 开关'));
-      if (st.pausedBySentence) { // the keys that go on from here, also as buttons (tablets have no keyboard)
-        [['A', '上一句', function () { navigate(-1); }], ['S', '重听', function () { navigate(0); }], ['D', '下一句', function () { navigate(1); }], ['E', '继续', togglePlay]].forEach(function (k) {
-          var b = el('span', 'ss-key'); b.appendChild(el('span', 'ss-kbd', k[0])); b.appendChild(document.createTextNode(k[1]));
-          b.__ssAct = k[2];
-          st.pill.appendChild(b);
-        });
-      }
-    }
-    st.pill.style.display = 'flex';
-    var rr = root.getBoundingClientRect(), cr = cuesRect(), w = st.pill.offsetWidth, h = st.pill.offsetHeight;
-    var mid = cr ? (cr.left + cr.right) / 2 - rr.left : rr.width / 2;
-    var top = cr ? cr.top - rr.top - h - 6 : rr.height * 0.72;
-    st.pill.style.left = Math.round(Math.max(8, Math.min(rr.width - w - 8, mid - w / 2))) + 'px';
-    st.pill.style.top = Math.round(Math.max(8, top)) + 'px';
   }
 
   // ---------- subtitle text: hover to pause, click a word for its meaning ----------
@@ -897,7 +839,7 @@
     if (container.__ssHover) return;
     container.__ssHover = true;
     container.addEventListener('mouseover', function (e) { if (cueNodeOf(e.target)) { st.hovering = true; hoverEnter(); } });
-    container.addEventListener('mouseout', function (e) { if (cueNodeOf(e.target) && !cueNodeOf(e.relatedTarget)) { st.hovering = false; if (!inPopup(e.relatedTarget) && !inPill(e.relatedTarget)) hoverLeave(); } });
+    container.addEventListener('mouseout', function (e) { if (cueNodeOf(e.target) && !cueNodeOf(e.relatedTarget)) { st.hovering = false; if (!inPopup(e.relatedTarget)) hoverLeave(); } });
     // After A/S/D/E the next sentence appears under a mouse that has not moved: that is not a hover.
     container.addEventListener('mousemove', function (e) { if (st.hoverSuppressed && cueNodeOf(e.target)) { st.hoverSuppressed = false; hoverEnter(); } });
   }
@@ -976,11 +918,9 @@
     });
   }
   function inPopup(node) { return Boolean(st.popup && node && st.popup.contains(node)); }
-  function inPill(node) { return Boolean(st.pill && node && st.pill.contains(node)); }
   function inPanel(node) { return Boolean(st.panel && node && st.panel.contains(node)); }
   function hoverEnter() {
     clearTimeout(st.hoverTimer);
-    renderPill();
     if (st.hoverSuppressed || !pref(LS_HOVER, true) || st.paused !== false) return;
     st.pausedByHover = true;
     safeDispatch({ type: 'setProp', propName: 'paused', propValue: true });
@@ -988,9 +928,7 @@
   function hoverLeave() {
     clearTimeout(st.hoverTimer);
     st.hoverTimer = setTimeout(function () {
-      if (st.hovering || st.overPill) return; // the mouse is still on the text or on the switch above it
-      renderPill();
-      if (st.popup) return; // keep the frame while the dictionary is open
+      if (st.popup || st.hovering) return; // keep the frame while the dictionary is open or the mouse is still on the text
       resumeAfterHover();
     }, 350);
   }
@@ -1011,6 +949,26 @@
     st.popup = null; st.popupWord = null;
     if (st.videoEl) hoverLeave();
   }
+  // The word read aloud: an mp3 through the addon server (it fetches and keeps Youdao's recording), or
+  // the browser's own speech synthesis when that is not available.
+  var voice = null;
+  function speak(text) {
+    text = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!text) return;
+    try { if (voice) voice.pause(); } catch (e) { /* already gone */ }
+    var a = voice = new Audio(BASE + '/tts?q=' + encodeURIComponent(text)), failed = false;
+    var fallback = function () {
+      if (failed || voice !== a) return;
+      failed = true;
+      try {
+        var u = new SpeechSynthesisUtterance(text); u.lang = 'en-US';
+        window.speechSynthesis.cancel(); window.speechSynthesis.speak(u);
+      } catch (e) { /* no speech synthesis here */ }
+    };
+    a.addEventListener('error', fallback);
+    var played = a.play();
+    if (played && played.catch) played.catch(fallback);
+  }
   function runAct(node, stop) { // elements of this script carry their click handler in __ssAct
     while (node && node !== stop) { if (typeof node.__ssAct === 'function') { node.__ssAct(node); return true; } node = node.parentNode; }
     return false;
@@ -1022,8 +980,10 @@
     var root = st.root || document.body;
     var pop = el('div', 'ss-pop');
     pop.addEventListener('mouseleave', function (e) { if (!cueNodeOf(e.relatedTarget)) closePopup(); });
-    var head = el('div', 'ss-pw'), phon = el('span', 'ss-ph'), add = el('span', 'ss-add');
-    head.appendChild(el('span', null, q)); head.appendChild(phon); head.appendChild(add);
+    var head = el('div', 'ss-pw'), phon = el('span', 'ss-ph'), say = el('span', 'ss-say', '🔊'), add = el('span', 'ss-add');
+    say.title = '再听一遍'; say.__ssAct = function () { speak(q); };
+    head.appendChild(el('span', null, q)); head.appendChild(phon); head.appendChild(say); head.appendChild(add);
+    if (pref(LS_VOICE, true)) speak(q);
     pop.appendChild(head);
     var body = el('div', 'ss-muted', '查询中…');
     pop.appendChild(body);
@@ -1086,7 +1046,7 @@
     var block = cueNodeOf(anchor), br = block ? block.getBoundingClientRect() : r;
     var w = pop.offsetWidth, h = pop.offsetHeight;
     var left = Math.max(8, Math.min(rr.width - w - 8, r.left - rr.left + r.width / 2 - w / 2));
-    var top = br.top - rr.top - h - 10 - (pillVisible() ? st.pill.offsetHeight + 6 : 0);
+    var top = br.top - rr.top - h - 10;
     if (top < 8) top = br.bottom - rr.top + 10;
     pop.style.left = left + 'px';
     pop.style.top = top + 'px';
@@ -1310,7 +1270,7 @@
   }
   ['mousedown', 'mouseup', 'dblclick'].forEach(function (type) {
     window.addEventListener(type, function (e) {
-      if (wordTarget(e) || inPopup(e.target) || inPill(e.target) || inPanel(e.target)) e.stopImmediatePropagation();
+      if (wordTarget(e) || inPopup(e.target) || inPanel(e.target)) e.stopImmediatePropagation();
       if (type === 'mouseup' && containerOf(e.target)) {
         var sel = window.getSelection ? String(window.getSelection()).replace(/\s+/g, ' ').trim() : '';
         if (sel && /\s/.test(sel) && sel.length <= 200) {
@@ -1330,7 +1290,6 @@
       return;
     }
     if (inPopup(e.target)) { e.stopImmediatePropagation(); runAct(e.target, st.popup); return; }
-    if (inPill(e.target)) { e.stopImmediatePropagation(); runAct(e.target, st.pill); return; }
     if (inPanel(e.target)) { e.stopImmediatePropagation(); runAct(e.target, st.panel); return; }
     if (st.popup) closePopup();
   }, true);

@@ -657,6 +657,8 @@ async function handleSub(res, shortKey, key, query) {
   if (!job) return send(res, 404, 'unknown video');
   const bi = query.get('bi') === '1';
   const hasEng = (job.entries || []).some((e) => ENG.has(e.lang));
+  // ?dl=1 downloads the file, named after the video: "<title>.en-zh.srt" for the bilingual ones
+  const saveAs = (suffix) => (query.get('dl') === '1' ? `${titleFor(job).replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, 150) || 'subtitle'}.${suffix}.srt` : null);
   if (key === 'align') { // "▶" entry: start alignment, serve the best English subtitle when done or after ACTION_WAIT_MS
     const entry = bestEntry(job, ENG) || bestEntry(job, CHI);
     if (!entry) return send(res, 404, 'nothing to align');
@@ -668,7 +670,7 @@ async function handleSub(res, shortKey, key, query) {
   if (key === 'mt-start' || key === 'mt') {
     if (!translate.enabled()) return send(res, 404, 'translation disabled');
     if (!hasEng) return send(res, 404, 'no english subtitle');
-    beginText(res);
+    beginText(res, saveAs(bi ? 'en-zh' : 'zh'));
     if (key === 'mt-start') { // "▶" entry: start alignment and translation, wait a while for the result
       startAlign(job);
       const mt = ensureTranslation(job);
@@ -682,7 +684,7 @@ async function handleSub(res, shortKey, key, query) {
   // alignment, its first-ranked entry before). `?bi=1` on a Chinese entry pairs that one instead.
   const entry = key === 'bi' ? bestEntry(job, CHI) : (job.entries || []).find((e) => subKey(e) === key);
   if (!entry) return send(res, 404, key === 'bi' ? 'no chinese subtitle' : 'unknown subtitle');
-  beginText(res);
+  beginText(res, saveAs((bi || key === 'bi') && CHI.has(entry.lang) ? 'en-zh' : CHI.has(entry.lang) ? 'zh' : ENG.has(entry.lang) ? 'en' : entry.lang));
   let cues = await loadCues(job, entry);
   if ((bi || key === 'bi') && CHI.has(entry.lang)) {
     const en = bestEntry(job, ENG);
@@ -777,9 +779,14 @@ async function handleVocab(req, res, url) {
 
 // The streaming engine fetches subtitle files with a 10 s timeout that is cleared once response headers
 // arrive, so send them right away and deliver the body when alignment or translation is ready.
-function beginText(res) {
+function beginText(res, downloadName) {
   if (res.headersSent) return;
-  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
+  const headers = { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' };
+  if (downloadName) { // ?dl=1: save as a file instead of showing the text
+    const ascii = downloadName.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+    headers['content-disposition'] = `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`;
+  }
+  res.writeHead(200, headers);
   res.flushHeaders();
 }
 
@@ -818,6 +825,12 @@ http.createServer(async (req, res) => {
     }
     if (rest[0] === 'action' && rest.length === 2 && req.method === 'POST') return await handleAction(req, res, rest[1]);
     if (rest[0] === 'vocab' && rest.length === 1) return await handleVocab(req, res, url);
+    if (rest[0] === 'tts') { // pronunciation of a clicked word (mp3)
+      const data = await dict.voice(url.searchParams.get('q'), url.searchParams.get('accent'), path.join(CACHE_DIR, 'tts')).catch((e) => { log('tts failed', e.message); return null; });
+      if (!data) return send(res, 404, { error: 'no audio' });
+      res.writeHead(200, { 'content-type': 'audio/mpeg', 'content-length': data.length, 'access-control-allow-origin': '*', 'cache-control': 'public, max-age=2592000' });
+      return res.end(data);
+    }
     if (rest[0] === 'dict') {
       const q = (url.searchParams.get('q') || '').trim().slice(0, 200);
       const ctx = (url.searchParams.get('ctx') || '').trim().slice(0, 600);

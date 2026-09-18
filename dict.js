@@ -1,14 +1,20 @@
 // Word / phrase lookup for the click-to-translate feature of the web UI. Youdao's public dictionary
 // endpoint answers English words and phrases with phonetics and Chinese senses (fast, no key, reachable
 // from China); the translation model (when configured) explains what the selection means in the sentence
-// it was clicked in and translates free text the dictionary does not know.
+// it was clicked in and translates free text the dictionary does not know. Youdao also speaks the word
+// (an mp3 per word or phrase), fetched by the server and kept on disk so the browser plays it from here.
 'use strict';
 
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const crypto = require('crypto');
 const translate = require('./translate');
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
 const YOUDAO = process.env.YOUDAO_DICT_URL || 'https://dict.youdao.com/jsonapi';
 const MYMEMORY = process.env.MYMEMORY_URL || 'https://api.mymemory.translated.net/get';
+const VOICE = process.env.YOUDAO_VOICE_URL || 'https://dict.youdao.com/dictvoice';
 const CACHE_MAX = 5000;
 const cache = new Map();
 
@@ -89,4 +95,22 @@ async function lookup(q, ctx) {
   return remember(key, out);
 }
 
-module.exports = { lookup };
+// Pronunciation of a word or short phrase as mp3 (accent: 'us' or 'uk'), cached under <dir>.
+async function voice(q, accent, dir) {
+  const text = String(q || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (!text || !/[A-Za-z]/.test(text)) return null;
+  const type = accent === 'uk' ? 1 : 2;
+  const file = path.join(dir, `${crypto.createHash('sha1').update(`${type}|${text.toLowerCase()}`).digest('hex')}.mp3`);
+  try { return await fsp.readFile(file); } catch (_) { /* not cached yet */ }
+  const res = await fetch(`${VOICE}?audio=${encodeURIComponent(text)}&type=${type}`, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`voice HTTP ${res.status}`);
+  const kind = res.headers.get('content-type') || '';
+  const data = Buffer.from(await res.arrayBuffer());
+  if (!/^audio\//.test(kind) || data.length < 200 || data.length > 2 * 1024 * 1024) throw new Error(`voice: unexpected reply (${kind}, ${data.length} bytes)`);
+  await fsp.mkdir(dir, { recursive: true });
+  await fsp.writeFile(`${file}.${process.pid}.tmp`, data);
+  await fsp.rename(`${file}.${process.pid}.tmp`, file);
+  return data;
+}
+
+module.exports = { lookup, voice };
