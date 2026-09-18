@@ -47,7 +47,13 @@ const ALIGN_AUDIO = process.env.ALIGN_AUDIO === '1';
 const ENG = new Set(['eng', 'en']);
 const CHI = new Set(['chi', 'zho', 'zht', 'zhs', 'chs', 'cht', 'ze', 'zh']);
 const ALIGN_LANGS = new Set((process.env.ALIGN_LANGS || [...ENG, ...CHI].join(',')).split(','));
-const MT_LANG = 'chi'; // every Chinese variant is listed as "chi" so the player shows one 中文 group
+const MT_LANG = 'chi'; // Simplified Chinese variants are listed as "chi": one 中文 group in the player
+// Traditional Chinese gets a group of its own, so that bilingual pairing (which takes the best-matching
+// Chinese subtitle) never lands on a Traditional one. The player shows a language code it does not know
+// as it is, so the "code" is simply the name to display.
+const TRAD_LANG = process.env.TRAD_LANG || '繁体中文';
+const TRAD_CODES = new Set(['zht', 'cht']);
+const CHT = new Set(CHI); // same codes; bestEntry(job, CHT) means "Traditional entries only"
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
 
 if (!TOKEN || !PUBLIC_BASE) {
@@ -187,6 +193,24 @@ function heuristic(job, entry) {
   return score;
 }
 
+// Simplified or Traditional? OpenSubtitles' language codes are not reliable (Traditional files are
+// uploaded as "chi"), so once a file is on disk its text decides: count characters that exist in only
+// one of the two scripts.
+const TRAD_ONLY = '這個們來時說對會過還沒麼樣為與學點裡後現發實開關問題從應該讓嗎聽見覺愛處變體國長東車馬門間電話錢買賣讀寫';
+const SIMP_ONLY = '这个们来时说对会过还没么样为与学点里后现发实开关问题从应该让吗听见觉爱处变体国长东车马门间电话钱买卖读写';
+function isTraditionalText(text) {
+  let trad = 0, simp = 0;
+  for (const ch of text) { if (TRAD_ONLY.includes(ch)) trad++; else if (SIMP_ONLY.includes(ch)) simp++; }
+  return trad + simp >= 20 ? trad > simp : null; // null: not enough evidence
+}
+
+function isTraditional(job, entry) {
+  if (!CHI.has(entry.lang)) return false;
+  const r = job.results[subKey(entry)];
+  if (r && typeof r.trad === 'boolean') return r.trad;
+  return TRAD_CODES.has(entry.lang);
+}
+
 function isGood(r) {
   const mode = r.refMode || '';
   const inSync = typeof r.rscore === 'number' && r.rscore >= GOOD_SYNC && r.score >= MIN_COVER;
@@ -241,6 +265,10 @@ function getJob(videoKey, meta = {}) {
     else if (saved.state === 'noref' || saved.state === 'novideo') job.align.state = saved.state;
   } catch (_) { /* fresh */ }
   backfillSync(job);
+  for (const r of Object.values(job.results)) { // results cached before the script was recorded
+    if (r.status !== 'done' || (r.cjk || 0) < 0.3 || typeof r.trad === 'boolean') continue;
+    try { const t = isTraditionalText(fs.readFileSync(path.join(dir, `${r.key}.orig.srt`), 'utf8')); if (t !== null) r.trad = t; } catch (_) { /* file gone */ }
+  }
   try {
     const saved = JSON.parse(fs.readFileSync(path.join(dir, 'job.json'), 'utf8'));
     if (!job.mtInfo && saved.mtInfo) job.mtInfo = saved.mtInfo;
@@ -301,6 +329,8 @@ async function alignOne(job, entry) {
     // Timings in original cue order (piecewise shifts may reorder cues when re-sorted by time).
     await fsp.writeFile(path.join(job.dir, `${key}.times.json`), JSON.stringify(res.aligned));
     await fsp.writeFile(path.join(job.dir, `${key}.srt`), formatSrt(blocks.map((b, i) => ({ ...b, start: res.aligned[i][0], end: res.aligned[i][1] }))));
+    const trad = isTraditionalText(blocks.map((b) => b.text).join(''));
+    if (trad !== null) r.trad = trad;
     Object.assign(r, {
       cjk: blocks.filter((b) => /[㐀-鿿]/.test(b.text)).length / blocks.length,
       status: 'done', refMode: job.refMode, score: res.score, rscore: res.rscore, origScore: res.origScore,
@@ -390,15 +420,14 @@ async function consensusReference(job, entries) {
   job.ref = { cues: best.cues, windowEnd: best.cues[best.cues.length - 1][1] };
 }
 
-// Between equally good Chinese subtitles prefer Simplified over Traditional.
-function tradPenalty(entry) { return entry.lang === 'zht' || entry.lang === 'cht' ? 0.005 : 0; }
-
 // Best subtitle of a language: highest aligned score if alignment finished, else the heuristic favourite.
 function bestEntry(job, langs, { alignedOnly = false } = {}) {
-  const list = (job.entries || []).filter((e) => langs.has(e.lang));
+  const chinese = langs === CHI || langs === CHT;
+  // CHI = Simplified only (what bilingual pairs with English), CHT = Traditional only.
+  const list = (job.entries || []).filter((e) => langs.has(e.lang) && (!chinese || isTraditional(job, e) === (langs === CHT)));
   const aligned = list.map((e) => ({ e, r: job.results[subKey(e)] }))
-    .filter((x) => x.r && x.r.status === 'done' && isGood(x.r) && (langs !== CHI || (x.r.cjk || 0) >= 0.3))
-    .sort((a, b) => (b.r.score - tradPenalty(b.e)) - (a.r.score - tradPenalty(a.e)));
+    .filter((x) => x.r && x.r.status === 'done' && isGood(x.r) && (!chinese || (x.r.cjk || 0) >= 0.3))
+    .sort((a, b) => b.r.score - a.r.score);
   if (aligned.length) return aligned[0].e;
   if (alignedOnly || !list.length) return null;
   return list.map((e, i) => ({ e, s: heuristic(job, e) - i * 0.01 })).sort((a, b) => b.s - a.s)[0].e;
@@ -524,18 +553,17 @@ async function upstreamList(type, id, extra) {
 }
 
 function variantTag(entry) {
-  if (entry.lang === 'zht' || entry.lang === 'cht') return '繁体';
-  if (entry.lang === 'ze') return '中英';
-  return '';
+  return entry.lang === 'ze' ? '中英' : '';
 }
 
 // A listed label is never updated by the player, and a long status in front hides what the entry is. So
 // the label is the entry's name (language, variant, release) and a warning follows only when alignment
 // found a problem; nothing is said about subtitles that are fine or were never aligned. The web UI shows
 // the warning on the second line of the entry instead.
-function titleOf(entry) {
+function titleOf(job, entry) {
   const tags = [variantTag(entry), releaseTag(entry)].filter(Boolean);
-  return `${CHI.has(entry.lang) ? '中文' : 'English'}${tags.length ? ` · ${tags.join(' · ')}` : ''}`;
+  const name = !CHI.has(entry.lang) ? 'English' : isTraditional(job, entry) ? '繁体中文' : '中文';
+  return `${name}${tags.length ? ` · ${tags.join(' · ')}` : ''}`;
 }
 
 function warningOf(job, entry) {
@@ -551,7 +579,7 @@ function warningOf(job, entry) {
 function labelFor(job, entry) {
   if (!ALIGN_LANGS.has(entry.lang)) return undefined;
   const warn = warningOf(job, entry);
-  return warn ? `${titleOf(entry)} · ${warn}` : titleOf(entry);
+  return warn ? `${titleOf(job, entry)} · ${warn}` : titleOf(job, entry);
 }
 
 function subUrl(job, name, query) {
@@ -560,14 +588,14 @@ function subUrl(job, name, query) {
 
 function rankScore(job, e, i) {
   const r = job.results[subKey(e)];
-  return (r && r.status === 'done' ? (isGood(r) ? 2000 : 1000) + (r.score || 0) * 100 : heuristic(job, e) - i * 0.01) - tradPenalty(e) * 100;
+  return r && r.status === 'done' ? (isGood(r) ? 2000 : 1000) + (r.score || 0) * 100 : heuristic(job, e) - i * 0.01;
 }
 
 function buildList(job) {
   const entries = job.entries || [];
   const groups = new Map();
   for (const e of entries) {
-    const lang = CHI.has(e.lang) ? MT_LANG : e.lang;
+    const lang = !CHI.has(e.lang) ? e.lang : isTraditional(job, e) ? TRAD_LANG : MT_LANG;
     if (!groups.has(lang)) groups.set(lang, []);
     groups.get(lang).push(e);
   }
@@ -579,14 +607,14 @@ function buildList(job) {
   if (canTranslate && job.mtInfo && !groups.has(MT_LANG)) groups.set(MT_LANG, []);
   const out = [];
   for (const [lang, list] of groups) {
-    const managed = ENG.has(lang) || lang === MT_LANG;
+    const managed = ENG.has(lang) || lang === MT_LANG || lang === TRAD_LANG;
     if (!managed) { for (const e of list) out.push({ id: `subsync-${subKey(e)}`, lang, url: e.url }); continue; }
     list.map((e, i) => ({ e, s: rankScore(job, e, i) })).sort((a, b) => b.s - a.s).forEach(({ e }) => {
       out.push({ id: `subsync-${subKey(e)}`, lang, url: subUrl(job, subKey(e)), label: labelFor(job, e) });
     });
     if (lang === MT_LANG) {
-      // One bilingual entry per kind, never first: the best English with the best human Chinese, and the
-      // AI translation once generated.
+      // One bilingual entry per kind, never first: the best English with the best human Simplified Chinese,
+      // and the AI translation once generated. The Traditional group has subtitles only.
       if (list.length && hasEng) out.push({ id: 'subsync-bi', lang, url: subUrl(job, 'bi'), label: '🀄 中英双语（人工字幕）' });
       if (canTranslate && job.mtInfo) {
         out.push({ id: 'subsync-mt', lang, url: subUrl(job, 'mt'), label: '🤖 AI 中文字幕' });
@@ -670,23 +698,24 @@ function statusOf(job) {
     if (!ALIGN_LANGS.has(e.lang)) continue;
     const r = job.results[subKey(e)] || null;
     subs[subKey(e)] = {
-      lang: CHI.has(e.lang) ? MT_LANG : 'eng',
+      lang: !CHI.has(e.lang) ? 'eng' : isTraditional(job, e) ? 'cht' : MT_LANG,
       status: r ? r.status : 'none',
       score: r && r.status === 'done' ? Math.round(r.score * 100) / 100 : null,
       sync: r && r.status === 'done' && typeof r.rscore === 'number' ? Math.round(r.rscore * 100) / 100 : null,
       good: Boolean(r && r.status === 'done' && isGood(r)),
-      title: titleOf(e),
+      title: titleOf(job, e),
       warn: warningOf(job, e),
       label: labelFor(job, e),
     };
   }
-  const bestEn = bestEntry(job, ENG, { alignedOnly: true }), bestZh = bestEntry(job, CHI, { alignedOnly: true });
+  const bestEn = bestEntry(job, ENG, { alignedOnly: true }), bestZh = bestEntry(job, CHI, { alignedOnly: true }), bestZht = bestEntry(job, CHT, { alignedOnly: true });
   return {
     ok: true, key: job.shortKey, title: titleFor(job),
     align: { ...job.align, refMode: job.refMode || null, running: Boolean(job.alignPromise) },
     translate: translateStatus(job),
-    best: { en: bestEn ? subKey(bestEn) : null, zh: bestZh ? subKey(bestZh) : null },
-    hasHumanZh: (job.entries || []).some((e) => CHI.has(e.lang)),
+    best: { en: bestEn ? subKey(bestEn) : null, zh: bestZh ? subKey(bestZh) : null, zht: bestZht ? subKey(bestZht) : null },
+    tradLang: TRAD_LANG,
+    hasHumanZh: (job.entries || []).some((e) => CHI.has(e.lang) && !isTraditional(job, e)),
     hasEng: (job.entries || []).some((e) => ENG.has(e.lang)),
     subs,
   };

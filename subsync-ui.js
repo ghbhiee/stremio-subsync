@@ -14,6 +14,7 @@
   var BASE = MANIFEST.replace(/\/manifest\.json$/, '');
   var SUB_RE = /\/sub\/([0-9a-f]{16})\/([^/?#]+)\.srt(?:\?([^#]*))?$/;
   var CHI = { chi: 1, zho: 1, zht: 1, zhs: 1, chs: 1, cht: 1, ze: 1, zh: 1 };
+  var TRAD = '繁体中文'; // the addon lists Traditional Chinese as a language of its own, named like this
   var LS_BI = 'subsync.bilingual', LS_HOVER = 'subsync.hoverPause';
   var POLL_MS = 2500;
   var ORIGIN = '字幕对齐';
@@ -59,7 +60,7 @@
     var m = u && SUB_RE.exec(u);
     if (!m) return null;
     var q = m[3] || '';
-    return { shortKey: m[1], key: m[2], bi: /(^|&)bi=1(&|$)/.test(q), live: Boolean(st.live[track.id]), lang: track.lang, isZh: Boolean(CHI[track.lang]) };
+    return { shortKey: m[1], key: m[2], bi: /(^|&)bi=1(&|$)/.test(q), live: Boolean(st.live[track.id]), lang: track.lang, isZh: Boolean(CHI[track.lang]), isTrad: track.lang === TRAD };
   }
   function selectedTrack() {
     for (var i = 0; i < st.tracks.length; i++) if (st.tracks[i].id === st.selectedId) return st.tracks[i];
@@ -258,7 +259,7 @@
       // The subtitle being watched turned out not to match the video while another one does: switch.
       var t = selectedTrack(), p = parseTrack(t);
       if (p && p.shortKey === st.shortKey && p.key !== 'mt' && p.key !== 'bi' && p.key !== 'align' && p.key !== 'mt-start') {
-        var info = s.subs[p.key], best = p.isZh ? s.best.zh : s.best.en;
+        var info = s.subs[p.key], best = p.isTrad ? s.best.zht : p.isZh ? s.best.zh : s.best.en;
         if (info && !info.good && best && best !== p.key) {
           addLive(best, false, p.lang);
           toast('当前字幕与视频不匹配，已切换到最佳字幕：' + (s.subs[best] ? s.subs[best].title : best), 'info');
@@ -531,7 +532,7 @@
     if (m.list.style.display !== 'flex') { m.list.style.display = 'flex'; m.list.style.flexDirection = 'column'; }
     for (var i = 0; i < m.list.children.length; i++) {
       var c = m.list.children[i], code = c.getAttribute('data-lang');
-      var order = !code ? -3 : code === 'eng' ? -2 : code === 'zho' ? -1 : 0;
+      var order = !code ? -4 : code === 'eng' ? -3 : code === 'zho' ? -2 : code === TRAD ? -1 : 0; // OFF, English, 中文, 繁体中文, the rest
       if (c.style.order !== String(order)) c.style.order = String(order);
       if (c.style.flexShrink !== '0') c.style.flexShrink = '0';
     }
@@ -599,8 +600,8 @@
         else if (a.state === 'novideo') bar.appendChild(cell(el('span', null, '无法对齐：引擎里没有该视频'), button('重试', function () { postAction({ align: true }); })));
         else if (a.state === 'failed') bar.appendChild(cell(el('span', null, '对齐失败：' + (a.error || '')), button('重试', function () { postAction({ align: true }); })));
         else if (a.state === 'done' && p && p.key !== 'mt' && p.key !== 'bi' && s.subs[p.key] && !s.subs[p.key].good) {
-          var best = p.isZh ? s.best.zh : s.best.en;
-          if (best && best !== p.key) bar.appendChild(cell(el('span', null, '当前字幕与视频不匹配'), button('切换到最佳', function () { addLive(best, false, p.isZh ? 'chi' : 'eng'); })));
+          var best = p.isTrad ? s.best.zht : p.isZh ? s.best.zh : s.best.en;
+          if (best && best !== p.key) bar.appendChild(cell(el('span', null, '当前字幕与视频不匹配'), button('切换到最佳', function () { addLive(best, false, p.lang); })));
         }
       }
     }
