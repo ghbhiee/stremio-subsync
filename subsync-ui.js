@@ -1,11 +1,11 @@
 // Web UI for the 字幕对齐 (stremio-subsync) addon, injected into a self-hosted stremio-web.
-// It adds to the player's subtitles menu: a bilingual switch and an "AI Chinese subtitle" button in the
-// Chinese column, an "align" button in the English column, live progress, and notifications when the
-// work finishes (the finished subtitle is then loaded without interrupting playback). It also keeps
-// English first and Chinese second in the language list, maps A/S/D to previous / repeat / next
-// sentence, pauses while the mouse rests on the subtitle and shows a Chinese dictionary entry when an
-// English word is clicked. Everything is best-effort: if the player's internals cannot be found, the
-// stock UI keeps working unchanged.
+// It attaches a bar above the player's subtitles menu (bilingual switch, "generate AI Chinese subtitle"
+// and "align" buttons, live progress) and shows notifications when the work finishes (the finished
+// subtitle is then loaded without interrupting playback). It also keeps English first and Chinese
+// second in the language list, maps A/S/D to previous / repeat / next sentence, pauses while the mouse
+// rests on the subtitle and shows a Chinese dictionary entry when an English word is clicked, for
+// addon subtitles and for subtitle tracks embedded in the video alike. Everything is best-effort: if
+// the player's internals cannot be found, the stock UI keeps working unchanged.
 (function () {
   'use strict';
 
@@ -24,8 +24,10 @@
     time: null, paused: null, delay: 0, preview: [], streamSig: null,
     shortKey: null, status: null, statusAt: 0, pollTimer: null,
     live: {}, liveN: 0, alignEpoch: 0, mtEpoch: 0, mtPartial: false, mtPromptShown: false,
-    pausedByHover: false, hoverTimer: null, popup: null, popupWord: null,
-    menuObserver: null, videoObserver: null,
+    pausedByHover: false, hovering: false, hoverTimer: null, popup: null, popupWord: null,
+    menuObserver: null, videoObserver: null, bar: null, barKey: '', wantMt: false,
+    embeddedId: null, embTrack: null, embEl: null,
+    embStyle: { size: 100, offset: 0, offsetMin: 0, color: 'rgb(255, 255, 255)', bg: 'rgba(0, 0, 0, 0)', outline: 'rgb(34, 34, 34)' },
   };
   var bound = typeof WeakSet === 'function' ? new WeakSet() : { has: function () { return false; }, add: function () {} };
   window.__subsync = st; // read-only debugging handle
@@ -68,9 +70,10 @@
   // ---------- styles ----------
 
   var css = [
-    '.ss-panel{margin:0 1rem .75rem;padding:.6rem .9rem;border-radius:var(--border-radius,.5rem);background:var(--overlay-color,rgba(255,255,255,.08));color:var(--primary-foreground-color,#fff);font-size:.95rem;line-height:1.45}',
-    '.ss-row{display:flex;align-items:center;gap:.5rem;margin:.2rem 0;min-height:1.6rem}',
-    '.ss-row .ss-txt{flex:1;min-width:0;overflow-wrap:anywhere}',
+    '.ss-bar{position:absolute;z-index:30;box-sizing:border-box;display:flex;flex-wrap:wrap;align-items:center;gap:.45rem 1.4rem;padding:.65rem 1.25rem;border-radius:var(--border-radius,.75rem);background:var(--modal-background-color,rgba(16,16,28,.95));backdrop-filter:blur(15px);box-shadow:0 .8rem 2rem rgba(0,0,0,.35);color:var(--primary-foreground-color,#fff);font-size:.95rem;line-height:1.4}',
+    '.ss-cell{display:flex;align-items:center;gap:.5rem;white-space:nowrap}',
+    // embedded tracks are drawn by this script (clickable words), so the browser's own cue rendering is hidden
+    'video.ss-own-cues::cue{color:transparent!important;background:transparent!important;text-shadow:none!important;opacity:0!important}',
     '.ss-btn{flex:none;cursor:pointer;padding:.25rem .6rem;border-radius:.4rem;border:0;background:var(--secondary-accent-color,#7b5bf5);color:#fff;font:inherit;font-size:.85rem}',
     '.ss-btn:hover{filter:brightness(1.15)}.ss-btn[disabled]{opacity:.5;cursor:default}',
     '.ss-sw{position:relative;flex:none;width:2.4rem;height:1.3rem;border-radius:1rem;background:rgba(255,255,255,.25);cursor:pointer;transition:background .15s}',
@@ -128,6 +131,13 @@
       case 'extraSubtitlesPreview': st.preview = Array.isArray(value) ? value : []; break;
       case 'extraSubtitlesTracks': st.tracks = Array.isArray(value) ? value : []; onTracks(); break;
       case 'selectedExtraSubtitlesTrackId': if (value !== st.selectedId) { st.selectedId = value; onSelection(); } break;
+      case 'selectedSubtitlesTrackId': st.embeddedId = value || null; onTextTrackChange(); renderBar(); break;
+      case 'subtitlesSize': if (typeof value === 'number') { st.embStyle.size = value; renderEmbedded(); } break;
+      case 'subtitlesOffset': if (typeof value === 'number') { st.embStyle.offset = value; renderEmbedded(); } break;
+      case 'subtitlesOffsetMinimum': if (typeof value === 'number') { st.embStyle.offsetMin = value; renderEmbedded(); } break;
+      case 'subtitlesTextColor': if (typeof value === 'string') { st.embStyle.color = value; renderEmbedded(); } break;
+      case 'subtitlesBackgroundColor': if (typeof value === 'string') { st.embStyle.bg = value; renderEmbedded(); } break;
+      case 'subtitlesOutlineColor': if (typeof value === 'string') { st.embStyle.outline = value; renderEmbedded(); } break;
     }
   }
 
@@ -142,10 +152,12 @@
         try { inst.on('propValue', onProp); inst.on('propChanged', onProp); } catch (e) { st.video = null; return false; }
         bound.add(inst);
       }
-      ['stream', 'time', 'paused', 'extraSubtitlesTracks', 'selectedExtraSubtitlesTrackId', 'extraSubtitlesDelay', 'extraSubtitlesPreview']
+      ['stream', 'time', 'paused', 'extraSubtitlesTracks', 'selectedExtraSubtitlesTrackId', 'extraSubtitlesDelay', 'extraSubtitlesPreview',
+        'selectedSubtitlesTrackId', 'subtitlesSize', 'subtitlesOffset', 'subtitlesOffsetMinimum', 'subtitlesTextColor', 'subtitlesBackgroundColor', 'subtitlesOutlineColor']
         .forEach(function (p) { safeDispatch({ type: 'observeProp', propName: p }); });
     }
     watchSubtitlesElement();
+    watchTextTracks();
     if (!st.menuObserver) {
       st.menuObserver = new MutationObserver(scheduleMenu);
       st.menuObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
@@ -154,7 +166,10 @@
   }
 
   function unbind() {
-    st.video = null; st.videoEl = null; st.subsEl = null;
+    if (st.embTrack) { try { st.embTrack.removeEventListener('cuechange', renderEmbedded); } catch (e) { /* gone */ } }
+    if (st.embEl && st.embEl.parentNode) st.embEl.parentNode.removeChild(st.embEl);
+    removeBar();
+    st.video = null; st.videoEl = null; st.subsEl = null; st.embTrack = null; st.embEl = null; st.embeddedId = null;
     if (st.menuObserver) { st.menuObserver.disconnect(); st.menuObserver = null; }
     if (st.videoObserver) { st.videoObserver.disconnect(); st.videoObserver = null; }
     closePopup();
@@ -164,8 +179,8 @@
   function resetVideo() {
     stopPolling();
     st.shortKey = null; st.status = null; st.statusAt = 0; st.live = {}; st.selSig = null;
-    st.alignEpoch = 0; st.mtEpoch = 0; st.mtPartial = false; st.mtPromptShown = false;
-    st.preview = []; st.pausedByHover = false;
+    st.alignEpoch = 0; st.mtEpoch = 0; st.mtPartial = false; st.mtPromptShown = false; st.wantMt = false;
+    st.preview = []; st.pausedByHover = false; st.barKey = '';
     closePopup();
   }
 
@@ -226,8 +241,13 @@
         && s.translate.coveredUntil > st.time / 1000 + 600 && s.translate.coveredUntil > 600) {
         st.mtPartial = true; st.mtEpoch++; // enough of the beginning is translated: show it now, the rest follows when done
       }
+      if (st.wantMt && translateReady(s)) { // the user asked for the AI subtitle while watching something else: switch to it
+        st.wantMt = false;
+        var cur = parseTrack(selectedTrack());
+        if (!(cur && cur.key === 'mt' && cur.shortKey === st.shortKey)) addLive('mt', pref(LS_BI, false), 'chi');
+      }
     }
-    renderPanel();
+    renderBar();
     syncDisplay();
   }
 
@@ -266,6 +286,7 @@
   function onSelection() {
     var t = selectedTrack(), p = parseTrack(t);
     if (p && !p.live) st.selSig = sigFor(p.key, p.bi);
+    renderBar();
     syncDisplay();
   }
 
@@ -294,7 +315,7 @@
       if (!useful) return;
     } else if (p.key === 'mt') {
       if (!translateReady(s)) { // nothing translated yet: an AI track would only show English
-        if (wantBi && !st.mtPromptShown && s.translate.enabled && s.translate.state !== 'running' && s.translate.state !== 'waiting-align') promptGenerate();
+        if (wantBi && !st.mtPromptShown && !st.wantMt && s.translate.enabled && s.translate.state !== 'running' && s.translate.state !== 'waiting-align') promptGenerate();
         remember(t, p, desired);
         return;
       }
@@ -369,7 +390,7 @@
     badgeTimer = setTimeout(function () { b.classList.remove('show'); }, 900);
   }
 
-  // ---------- subtitles menu: language order, panel, hidden action entries ----------
+  // ---------- subtitles menu: language order, hidden action entries, and the bar attached above it ----------
 
   var menuScheduled = false;
   function scheduleMenu() { // setTimeout, not requestAnimationFrame: the latter stops in a background tab
@@ -377,6 +398,7 @@
     menuScheduled = true;
     setTimeout(function () { menuScheduled = false; renderMenu(); }, 30);
   }
+  window.addEventListener('resize', scheduleMenu);
   function findMenu() {
     var lang = document.querySelector('[data-lang]');
     if (!lang) return null;
@@ -384,9 +406,13 @@
     if (!menu || menu.children.length < 2) return null;
     return { menu: menu, list: list, variants: menu.children[1] };
   }
+  function removeBar() {
+    if (st.bar && st.bar.parentNode) st.bar.parentNode.removeChild(st.bar);
+    st.barKey = '';
+  }
   function renderMenu() {
     var m = findMenu();
-    if (!m) { if (st.panel && st.panel.parentNode) st.panel.parentNode.removeChild(st.panel); return; }
+    if (!m) { removeBar(); return; }
     // English first, Chinese second (the player sorts languages by ISO code, which puts 中文 last).
     if (m.list.style.display !== 'flex') { m.list.style.display = 'flex'; m.list.style.flexDirection = 'column'; }
     for (var i = 0; i < m.list.children.length; i++) {
@@ -395,138 +421,172 @@
       if (c.style.order !== String(order)) c.style.order = String(order);
       if (c.style.flexShrink !== '0') c.style.flexShrink = '0';
     }
-    // The "▶" entries exist for clients without this UI; here the buttons below replace them.
+    // The "▶" entries exist for clients without this UI; here the buttons of the bar replace them.
     var vl = m.variants.children[m.variants.children.length - 1];
-    if (vl && vl !== st.panel) {
+    if (vl) {
       for (var j = 0; j < vl.children.length; j++) {
         var opt = vl.children[j];
-        var hide = /^\s*▶/.test(opt.textContent || '');
-        if (hide && opt.style.display !== 'none') opt.style.display = 'none';
+        if (/^\s*▶/.test(opt.textContent || '') && opt.style.display !== 'none') opt.style.display = 'none';
       }
     }
-    var selected = m.menu.querySelector('[data-lang].selected');
-    var code2 = selected ? selected.getAttribute('data-lang') : null;
-    if (code2 !== 'eng' && code2 !== 'zho') { if (st.panel && st.panel.parentNode) st.panel.parentNode.removeChild(st.panel); return; }
-    if (!st.panel) st.panel = el('div', 'ss-panel');
-    st.panel.setAttribute('data-ss-lang', code2);
-    if (st.panel.parentNode !== m.variants) m.variants.insertBefore(st.panel, m.variants.children[1] || null);
-    if (Date.now() - st.statusAt > 5000 && !st.pollTimer) fetchStatus().then(function (s) { if (busy(s)) startPolling(); });
-    renderPanel();
+    // The bar hangs above the menu, outside it, so the menu's own columns keep their room.
+    if (!st.bar) {
+      st.bar = el('div', 'ss-bar');
+      st.bar.addEventListener('mousedown', function (e) { e.subtitlesMenuClosePrevented = true; }); // the player closes the menu on outside clicks
+    }
+    var root = st.root || document.body;
+    if (st.bar.parentNode !== root) { root.appendChild(st.bar); st.barKey = ''; }
+    var mr = m.menu.getBoundingClientRect(), rr = root.getBoundingClientRect();
+    var left = Math.round(mr.left - rr.left) + 'px', width = Math.round(mr.width) + 'px', bottom = Math.round(rr.bottom - mr.top + 8) + 'px';
+    if (st.bar.style.left !== left) st.bar.style.left = left;
+    if (st.bar.style.width !== width) st.bar.style.width = width;
+    if (st.bar.style.bottom !== bottom) st.bar.style.bottom = bottom;
+    if (st.shortKey && Date.now() - st.statusAt > 5000 && !st.pollTimer) fetchStatus().then(function (s) { if (busy(s)) startPolling(); });
+    renderBar();
   }
 
   function alignText(s) {
     var a = s.align;
     if (a.running || a.state === 'running') {
       if (a.phase === 'video') return '查找视频…';
-      if (a.phase === 'reference') return '读取片头 10 分钟（需下载）…';
+      if (a.phase === 'reference') return '读取片头（需下载前 10 分钟）…';
       if (a.phase === 'consensus') return '比对候选字幕…';
       return '对齐中 ' + a.done + '/' + a.total;
     }
-    if (a.state === 'done') { var b = s.best.en && s.subs[s.best.en]; return '✅ 已对齐' + (b ? ' · 最佳：' + b.label : ' · 没有匹配的英文字幕'); }
-    if (a.state === 'noref') return '无法对齐：无内嵌字幕，候选字幕也不一致';
-    if (a.state === 'novideo') return '无法对齐：引擎里没有该视频';
-    if (a.state === 'failed') return '对齐失败：' + (a.error || '');
+    if (a.state === 'done') {
+      var b = s.best.en && s.subs[s.best.en];
+      return '✅ 已对齐' + (b ? '（最佳 ' + Math.round((b.score || 0) * 100) + '%）' : '（没有匹配的英文字幕）');
+    }
+    if (a.state === 'noref') return '无法对齐（无内嵌字幕，候选也不一致）';
+    if (a.state === 'novideo') return '无法对齐（引擎里没有该视频）';
+    if (a.state === 'failed') return '失败：' + (a.error || '');
     return '未对齐';
   }
   function translateText(s) {
     var t = s.translate;
     if (t.state === 'waiting-align') return '等待对齐后开始…';
     if (t.state === 'running') return '生成中 ' + t.done + '/' + t.total + (t.coveredUntil !== null ? '（已到 ' + fmtTime(t.coveredUntil) + '）' : '');
-    if (t.state === 'done') return '✅ 已生成' + (t.stale ? ' · 源字幕与视频不匹配' : '');
+    if (t.state === 'done') return '✅ 已生成' + (t.stale ? '（源字幕不匹配）' : '');
     if (t.state === 'failed') return '失败：' + (t.error || '');
     return '未生成';
   }
 
-  function renderPanel() {
-    var panel = st.panel;
-    if (!panel || !panel.parentNode) return;
-    var lang = panel.getAttribute('data-ss-lang'), s = st.status;
-    panel.textContent = '';
-    if (!s) { panel.appendChild(el('div', 'ss-muted', '读取状态…')); return; }
-    if (s.missing) { panel.appendChild(el('div', 'ss-muted', '服务已重启，请重新打开视频')); return; }
-    var row, btn;
-    if (lang === 'zho') {
-      row = el('div', 'ss-row');
-      var sw = el('div', 'ss-sw' + (pref(LS_BI, false) ? ' on' : ''));
-      sw.addEventListener('click', function () {
-        var on = !pref(LS_BI, false);
-        setPref(LS_BI, on);
-        sw.classList.toggle('on', on);
-        if (on) {
-          var p = parseTrack(selectedTrack());
-          if (p && p.key === 'mt' && s.translate.enabled && s.translate.state !== 'done' && s.translate.state !== 'running' && s.translate.state !== 'waiting-align') postAction({ bilingual: true });
-          else if (p && p.key !== 'mt' && s.align.state !== 'done' && !s.align.running) postAction({ align: true });
+  // Our Chinese track to show when bilingual is switched on while something else (an embedded track,
+  // English, another addon) is selected: the best aligned human subtitle, else a human one alignment has
+  // not rejected, else the AI track.
+  function pickChinese(s) {
+    var human = [], mt = null;
+    st.tracks.forEach(function (t) {
+      var p = parseTrack(t);
+      if (!p || p.live || !p.isZh || p.shortKey !== st.shortKey || p.key === 'mt-start') return;
+      if (p.key === 'mt') mt = t; else human.push({ t: t, p: p });
+    });
+    var i;
+    if (s && s.best.zh) for (i = 0; i < human.length; i++) if (human[i].p.key === s.best.zh) return human[i].t;
+    for (i = 0; i < human.length; i++) {
+      var info = s && s.subs[human[i].p.key];
+      if (!(info && info.status === 'done' && !info.good)) return human[i].t;
+    }
+    return mt || (human[0] && human[0].t) || null;
+  }
+
+  function onBilingual(on) {
+    setPref(LS_BI, on);
+    var s = st.status && !st.status.missing ? st.status : null;
+    var p = parseTrack(selectedTrack());
+    if (on && !(p && p.isZh && p.shortKey === st.shortKey)) {
+      var target = pickChinese(s);
+      if (target) { safeDispatch({ type: 'setProp', propName: 'selectedExtraSubtitlesTrackId', propValue: target.id }); p = parseTrack(target); }
+    }
+    if (on && s && p) {
+      var ts = s.translate.state;
+      if (p.key === 'mt') { if (s.translate.enabled && ts !== 'done' && ts !== 'running' && ts !== 'waiting-align') { st.wantMt = true; postAction({ bilingual: true }); } }
+      else if (s.align.state !== 'done' && !s.align.running) postAction({ align: true });
+    }
+    renderBar();
+    syncDisplay();
+  }
+
+  function cell() { var c = el('div', 'ss-cell'); for (var i = 0; i < arguments.length; i++) if (arguments[i]) c.appendChild(arguments[i]); return c; }
+  function button(label, onClick) { var b = el('button', 'ss-btn', label); b.addEventListener('click', onClick); return b; }
+
+  function renderBar() {
+    var bar = st.bar;
+    if (!bar || !bar.parentNode) return;
+    var s = st.status, p = parseTrack(selectedTrack());
+    var bi = pref(LS_BI, false), hover = pref(LS_HOVER, true);
+    var key = JSON.stringify([st.shortKey, !s ? null : s.missing ? 'missing' : [s.align.state, s.align.running, s.align.phase, s.align.done, s.align.total, s.align.error,
+      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng], bi, hover, st.selectedId, st.embeddedId]);
+    if (key === st.barKey) return; // nothing changed: leave the DOM alone (the menu observer would loop otherwise)
+    st.barKey = key;
+    bar.textContent = '';
+    if (st.shortKey) {
+      var sw = el('div', 'ss-sw' + (bi ? ' on' : ''));
+      sw.addEventListener('click', function () { onBilingual(!pref(LS_BI, false)); });
+      bar.appendChild(cell(sw, el('span', 'ss-title', '中英双语')));
+      if (!s) bar.appendChild(cell(el('span', 'ss-muted', '读取状态…')));
+      else if (s.missing) bar.appendChild(cell(el('span', 'ss-muted', '服务已重启，请重新打开视频')));
+      else {
+        if (s.translate.enabled && s.hasEng) {
+          var tb = null, ts = s.translate.state;
+          if (ts === 'idle' || ts === 'failed') tb = button(ts === 'failed' ? '重试' : '生成', function () { st.wantMt = true; postAction({ translate: true }); });
+          else if (ts === 'done' && s.translate.stale) tb = button('用最佳英文重新生成', function () { st.wantMt = true; postAction({ translate: true, force: true }); });
+          bar.appendChild(cell(el('span', null, 'AI 中文字幕：' + translateText(s)), tb));
         }
-        syncDisplay();
-      });
-      row.appendChild(sw);
-      row.appendChild(el('span', 'ss-txt ss-title', '中英双语'));
-      panel.appendChild(row);
-      if (s.translate.enabled && s.hasEng) {
-        row = el('div', 'ss-row');
-        row.appendChild(el('span', 'ss-txt', 'AI 中文字幕 · ' + translateText(s)));
-        if (s.translate.state === 'idle' || s.translate.state === 'failed') {
-          btn = el('button', 'ss-btn', s.translate.state === 'failed' ? '重试' : '生成');
-          btn.addEventListener('click', function () { postAction({ translate: true }); });
-          row.appendChild(btn);
-        } else if (s.translate.state === 'done' && s.translate.stale) {
-          btn = el('button', 'ss-btn', '用最佳英文重新生成');
-          btn.addEventListener('click', function () { postAction({ translate: true, force: true }); });
-          row.appendChild(btn);
+        var ab = null;
+        if (!s.align.running && s.align.state !== 'done') ab = button(s.align.state === 'idle' ? '开始对齐' : '重试', function () { postAction({ align: true }); });
+        else if (s.align.state === 'done' && p && p.shortKey === st.shortKey && p.key !== 'mt') {
+          var best = p.isZh ? s.best.zh : s.best.en;
+          if (best && best !== p.key) ab = button('切换到最佳', function () { addLive(best, p.isZh && pref(LS_BI, false), p.isZh ? 'chi' : 'eng'); });
         }
-        panel.appendChild(row);
+        bar.appendChild(cell(el('span', null, '字幕对齐：' + alignText(s)), ab));
       }
     }
-    row = el('div', 'ss-row');
-    row.appendChild(el('span', 'ss-txt', '字幕对齐 · ' + alignText(s)));
-    if (!s.align.running && s.align.state !== 'done' && !(s.align.state === 'noref' || s.align.state === 'novideo')) {
-      btn = el('button', 'ss-btn', s.align.state === 'failed' ? '重试' : '开始对齐');
-      btn.addEventListener('click', function () { postAction({ align: true }); });
-      row.appendChild(btn);
-    } else if (s.align.state === 'done') {
-      var best = lang === 'zho' ? s.best.zh : s.best.en, p2 = parseTrack(selectedTrack());
-      if (best && (!p2 || p2.key !== best)) {
-        btn = el('button', 'ss-btn', '切换到最佳');
-        btn.addEventListener('click', function () { addLive(best, lang === 'zho' && pref(LS_BI, false), lang === 'zho' ? 'chi' : 'eng'); });
-        row.appendChild(btn);
-      }
-    } else if (s.align.state === 'noref' || s.align.state === 'novideo') {
-      btn = el('button', 'ss-btn', '重试');
-      btn.addEventListener('click', function () { postAction({ align: true }); });
-      row.appendChild(btn);
-    }
-    panel.appendChild(row);
     var chk = el('label', 'ss-chk');
-    var input = el('input'); input.type = 'checkbox'; input.checked = pref(LS_HOVER, true);
-    input.addEventListener('change', function () { setPref(LS_HOVER, input.checked); });
+    var input = el('input'); input.type = 'checkbox'; input.checked = hover;
+    input.addEventListener('change', function () { setPref(LS_HOVER, input.checked); renderBar(); });
     chk.appendChild(input);
-    chk.appendChild(el('span', null, '悬停字幕暂停 · 点单词查词 · A/S/D 上一句/重听/下一句'));
-    panel.appendChild(chk);
+    chk.appendChild(el('span', null, '悬停字幕暂停'));
+    bar.appendChild(chk);
+    bar.appendChild(el('span', 'ss-muted', 'A/S/D 上一句/重听/下一句 · 点单词查词'));
   }
 
   // ---------- A / S / D: previous sentence, repeat, next sentence ----------
 
-  function cueList() {
-    var seen = {}, out = [];
-    for (var i = 0; i < st.preview.length; i++) {
-      var c = st.preview[i];
-      if (!c || typeof c.startTime !== 'number' || seen[c.startTime]) continue;
-      seen[c.startTime] = 1; out.push(c);
+  // Cue times (ms) of whatever subtitle is on screen: the addon/external track (the player publishes the
+  // cues around the playhead) or, when none is selected, the embedded text track the browser is showing.
+  function currentCues() {
+    var seen = {}, out = [], i, c;
+    if (st.selectedId) {
+      for (i = 0; i < st.preview.length; i++) {
+        c = st.preview[i];
+        if (!c || typeof c.startTime !== 'number' || seen[c.startTime]) continue;
+        seen[c.startTime] = 1; out.push({ startTime: c.startTime, endTime: c.endTime });
+      }
+      return { cues: out.sort(function (a, b) { return a.startTime - b.startTime; }), delay: st.delay || 0 };
     }
-    return out.sort(function (a, b) { return a.startTime - b.startTime; });
+    var t = st.embTrack;
+    if (t && t.mode === 'showing' && t.cues) {
+      for (i = 0; i < t.cues.length; i++) {
+        var start = Math.round(t.cues[i].startTime * 1000);
+        if (seen[start]) continue;
+        seen[start] = 1; out.push({ startTime: start, endTime: Math.round(t.cues[i].endTime * 1000) });
+      }
+    }
+    return { cues: out.sort(function (a, b) { return a.startTime - b.startTime; }), delay: 0 };
   }
   function navigate(dir) {
     if (st.time === null) return;
-    var cues = cueList();
+    var cc = currentCues(), cues = cc.cues;
     if (!cues.length) return;
-    var t = st.time - (st.delay || 0), cur = -1;
+    var t = st.time - cc.delay, cur = -1;
     for (var i = 0; i < cues.length; i++) { if (cues[i].startTime <= t + 150) cur = i; else break; }
     var inGap = cur >= 0 && t > cues[cur].endTime + 300, target = null;
     if (dir > 0) target = cur + 1 < cues.length ? cues[cur + 1] : null;
     else if (dir === 0) target = cur >= 0 ? cues[cur] : cues[0];
     else target = cur < 0 ? cues[0] : (inGap || cur === 0) ? cues[cur] : cues[cur - 1];
     if (!target) return;
-    safeDispatch({ type: 'setProp', propName: 'time', propValue: Math.max(0, Math.round(target.startTime + (st.delay || 0) - 60)) });
+    safeDispatch({ type: 'setProp', propName: 'time', propValue: Math.max(0, Math.round(target.startTime + cc.delay - 60)) });
     if (st.paused) { st.pausedByHover = false; safeDispatch({ type: 'setProp', propName: 'paused', propValue: false }); }
     badge(dir < 0 ? '◀ 上一句' : dir === 0 ? '↻ 重听本句' : '下一句 ▶');
   }
@@ -534,7 +594,7 @@
     if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || isInputFocused() || !st.video) return null;
     var code = e.code || ('Key' + String(e.key || '').toUpperCase());
     if (code !== 'KeyA' && code !== 'KeyS' && code !== 'KeyD') return null;
-    if (!st.preview.length) return null; // no subtitle cues: leave the player's own shortcuts alone
+    if (!currentCues().cues.length) return null; // no subtitle on screen: leave the player's own shortcuts alone
     return code === 'KeyA' ? -1 : code === 'KeyS' ? 0 : 1;
   }
   window.addEventListener('keydown', function (e) {
@@ -575,29 +635,103 @@
     var subs = null;
     for (var i = 0; i < container.children.length; i++) {
       var c = container.children[i];
-      if (c !== st.videoEl && c.tagName === 'DIV' && c.style.position === 'absolute' && c.style.textAlign === 'center') { subs = c; break; }
+      if (c !== st.videoEl && c.tagName === 'DIV' && !c.classList.contains('ss-emb') && c.style.position === 'absolute' && c.style.textAlign === 'center') { subs = c; break; }
     }
     if (subs && subs !== st.subsEl) {
       st.subsEl = subs;
       Array.prototype.forEach.call(subs.children, wrapWords);
-      if (!subs.__ssBound) {
-        subs.__ssBound = true;
+      if (!subs.__ssWrap) {
+        subs.__ssWrap = true;
         new MutationObserver(function (muts) {
           muts.forEach(function (mu) { Array.prototype.forEach.call(mu.addedNodes, function (n) { if (n.parentNode === subs) wrapWords(n); }); });
         }).observe(subs, { childList: true });
-        subs.addEventListener('mouseover', function (e) { if (cueNodeOf(e.target)) { st.hovering = true; hoverEnter(); } });
-        subs.addEventListener('mouseout', function (e) { if (cueNodeOf(e.target) && !cueNodeOf(e.relatedTarget)) { st.hovering = false; if (!inPopup(e.relatedTarget)) hoverLeave(); } });
       }
+      bindHover(subs);
     }
     if (!st.videoObserver) {
       st.videoObserver = new MutationObserver(function () { watchSubtitlesElement(); });
       st.videoObserver.observe(container, { childList: true });
     }
   }
+  function bindHover(container) {
+    if (container.__ssHover) return;
+    container.__ssHover = true;
+    container.addEventListener('mouseover', function (e) { if (cueNodeOf(e.target)) { st.hovering = true; hoverEnter(); } });
+    container.addEventListener('mouseout', function (e) { if (cueNodeOf(e.target) && !cueNodeOf(e.relatedTarget)) { st.hovering = false; if (!inPopup(e.relatedTarget)) hoverLeave(); } });
+  }
+  // The element holding the cue blocks: the player's own (addon subtitles) or ours (embedded tracks).
+  function containerOf(node) {
+    if (!node) return null;
+    if (st.subsEl && node !== st.subsEl && st.subsEl.contains(node)) return st.subsEl;
+    if (st.embEl && node !== st.embEl && st.embEl.contains(node)) return st.embEl;
+    return null;
+  }
   function cueNodeOf(node) {
-    if (!node || !st.subsEl || node === st.subsEl || !st.subsEl.contains(node)) return null;
-    while (node.parentNode !== st.subsEl) node = node.parentNode;
+    var c = containerOf(node);
+    if (!c) return null;
+    while (node.parentNode !== c) node = node.parentNode;
     return node.tagName === 'BR' ? null : node;
+  }
+
+  // ---------- embedded (native) subtitle tracks ----------
+  // The browser draws these itself (video::cue), so their words cannot be hovered or clicked. Hide that
+  // rendering with CSS and draw the active cues in an element of our own, styled like the player's.
+
+  function showingTrack() {
+    var list = st.videoEl && st.videoEl.textTracks;
+    if (!list) return null;
+    for (var i = 0; i < list.length; i++) if (list[i].mode === 'showing') return list[i];
+    return null;
+  }
+  function watchTextTracks() {
+    var v = st.videoEl;
+    if (!v || !v.textTracks || v.__ssTracks) { onTextTrackChange(); return; }
+    v.__ssTracks = true;
+    v.textTracks.addEventListener('change', onTextTrackChange);
+    v.textTracks.addEventListener('addtrack', onTextTrackChange);
+    v.addEventListener('webkitbeginfullscreen', onTextTrackChange);
+    v.addEventListener('webkitendfullscreen', onTextTrackChange);
+    onTextTrackChange();
+  }
+  function nativeFullscreen() { return Boolean(st.videoEl && st.videoEl.webkitDisplayingFullscreen); } // iPhone: only native cues are visible there
+  function onTextTrackChange() {
+    if (!st.videoEl) return;
+    var t = showingTrack();
+    if (t !== st.embTrack) {
+      if (st.embTrack) { try { st.embTrack.removeEventListener('cuechange', renderEmbedded); } catch (e) { /* gone */ } }
+      st.embTrack = t;
+      if (t) t.addEventListener('cuechange', renderEmbedded);
+    }
+    st.videoEl.classList.toggle('ss-own-cues', Boolean(t) && !nativeFullscreen());
+    renderEmbedded();
+  }
+  function renderEmbedded() {
+    var container = st.videoEl && st.videoEl.parentElement, t = st.embTrack, host = st.embEl;
+    if (!container) return;
+    if (!t || t.mode !== 'showing' || nativeFullscreen()) { if (host) host.textContent = ''; return; }
+    if (!host || host.parentNode !== container) {
+      host = st.embEl = el('div', 'ss-emb');
+      host.style.cssText = 'position:absolute;left:0;right:0;bottom:0;z-index:1;text-align:center';
+      container.appendChild(host);
+      bindHover(host);
+    }
+    var es = st.embStyle, o = es.outline;
+    host.style.bottom = Math.max(es.offset, es.offsetMin) + '%';
+    host.textContent = '';
+    var cues = t.activeCues ? Array.prototype.slice.call(t.activeCues) : [];
+    cues.forEach(function (cue) {
+      var block = el('div');
+      block.style.cssText = 'display:inline-block;padding:.2em;white-space:pre-wrap';
+      block.style.fontSize = Math.floor(es.size / 25) + 'vmin';
+      block.style.color = es.color;
+      block.style.backgroundColor = es.bg;
+      block.style.textShadow = ['-0.15rem -0.15rem', '0px -0.15rem', '0.15rem -0.15rem', '-0.15rem 0px', '0.15rem 0px', '-0.15rem 0.15rem', '0px 0.15rem', '0.15rem 0.15rem']
+        .map(function (d) { return d + ' 0.15rem ' + o; }).join(', ');
+      try { block.appendChild(cue.getCueAsHTML()); } catch (e) { block.textContent = String(cue.text || '').replace(/<[^>]+>/g, ''); }
+      wrapWords(block);
+      host.appendChild(block);
+      host.appendChild(el('br'));
+    });
   }
   function inPopup(node) { return Boolean(st.popup && node && st.popup.contains(node)); }
   function hoverEnter() {
@@ -664,7 +798,7 @@
     var url = BASE + '/dict?q=' + encodeURIComponent(q);
     var first = fetch(url).then(function (r) { return r.json(); });
     first.then(fill).catch(function () { fill(null); });
-    if (ctx && st.status && !st.status.missing && st.status.translate.enabled) {
+    if (ctx) { // the server adds the meaning in context when a translation model is configured
       fetch(url + '&ctx=' + encodeURIComponent(ctx)).then(function (r) { return r.json(); }).then(function (d) {
         if (st.popup !== pop || !d || !d.context) return;
         first.then(function (d0) { fill(Object.assign({}, d0 || {}, { context: d.context })); }).catch(function () { fill(d); });
@@ -684,12 +818,12 @@
 
   function wordTarget(e) {
     var n = e.target;
-    return n && n.nodeType === 1 && n.classList && n.classList.contains('ss-w') && st.subsEl && st.subsEl.contains(n) ? n : null;
+    return n && n.nodeType === 1 && n.classList && n.classList.contains('ss-w') && containerOf(n) ? n : null;
   }
   ['mousedown', 'mouseup', 'dblclick'].forEach(function (type) {
     window.addEventListener(type, function (e) {
       if (wordTarget(e) || inPopup(e.target)) e.stopImmediatePropagation();
-      if (type === 'mouseup' && st.subsEl && st.subsEl.contains(e.target)) {
+      if (type === 'mouseup' && containerOf(e.target)) {
         var sel = window.getSelection ? String(window.getSelection()).replace(/\s+/g, ' ').trim() : '';
         if (sel && /\s/.test(sel) && sel.length <= 200) {
           e.stopImmediatePropagation();
