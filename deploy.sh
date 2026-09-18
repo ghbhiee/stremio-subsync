@@ -4,7 +4,8 @@
 #   PUBLIC_BASE=https://media.example.com/subsync ./deploy.sh
 # Optional environment:
 #   DEEPSEEK_API_KEY  enables AI translation (stored in the env file, never printed)
-#   WEB_DIR           self-hosted stremio-web directory: installs the addon preinstall hook into index.html
+#   WEB_DIR           self-hosted stremio-web directory: installs the preinstall hook and the subtitle UI
+#                     script (subsync-ui.js) into index.html
 #   NGINX_SNIPPET     nginx file included inside your HTTPS server block: the proxy location is added to it
 #   SERVICE_USER      user the addon runs as (default: stremio)
 #   NODE_BIN          node >= 20 (default: node in PATH, else /opt/stremio-node/bin/node)
@@ -32,8 +33,8 @@ id "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --user-group --no-create-
 
 echo "== code"
 install -d $APP
-install -m644 "$S/server.js" "$S/align.js" "$S/translate.js" $APP/
-for f in server.js align.js translate.js; do "$NODE_BIN" --check $APP/$f; done
+install -m644 "$S/server.js" "$S/align.js" "$S/translate.js" "$S/dict.js" $APP/
+for f in server.js align.js translate.js dict.js; do "$NODE_BIN" --check $APP/$f; done
 
 echo "== env file"
 install -d /etc/stremio
@@ -59,6 +60,13 @@ if [ -n "${WEB_DIR:-}" ] && [ -f "$WEB_DIR/index.html" ]; then
   if ! grep -q 'tokencv-preinstall.js' "$WEB_DIR/index.html"; then
     cp -n "$WEB_DIR/index.html" "$WEB_DIR/index.html.bak-subsync"
     sed -i 's#</body>#<script src="tokencv-preinstall.js"></script></body>#' "$WEB_DIR/index.html"
+  fi
+  echo "== stremio-web subtitle UI (subsync-ui.js)"
+  sed "s#__SUBSYNC_MANIFEST__#$MANIFEST#" "$S/subsync-ui.js" > "$WEB_DIR/subsync-ui.js"
+  chmod 644 "$WEB_DIR/subsync-ui.js"
+  if ! grep -q 'subsync-ui.js' "$WEB_DIR/index.html"; then
+    cp -n "$WEB_DIR/index.html" "$WEB_DIR/index.html.bak-subsync"
+    sed -i 's#</body>#<script src="subsync-ui.js"></script></body>#' "$WEB_DIR/index.html"
   fi
 fi
 

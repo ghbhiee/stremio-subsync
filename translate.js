@@ -56,13 +56,46 @@ async function chat(messages) {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(`HTTP ${res.status} ${JSON.stringify(j).slice(0, 160)}`);
       const content = j.choices[0].message.content;
-      return { content, out: JSON.parse(content).t || {}, usage: j.usage || {} };
+      return { content, out: parseReply(content).t || {}, usage: j.usage || {} };
     } catch (e) {
       lastError = e;
       if (attempt < 3) await new Promise((r) => setTimeout(r, 1500 * attempt));
     }
   }
   throw lastError;
+}
+
+// The model sometimes appends text after the JSON object (or wraps it in a code fence), which made
+// JSON.parse throw and lose the whole batch. Take the first complete top-level object instead.
+function extractJson(content) {
+  const text = String(content || '');
+  const start = text.indexOf('{');
+  if (start < 0) throw new Error('no JSON object in reply');
+  let depth = 0, inString = false, escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  throw new Error('unterminated JSON object in reply');
+}
+
+function parseReply(content) {
+  try { return JSON.parse(content); } catch (_) { /* fall through */ }
+  try {
+    return JSON.parse(extractJson(content));
+  } catch (e) {
+    const text = String(content || '');
+    log('unparseable reply', `${text.length} chars`, JSON.stringify(text.slice(0, 200)), '…', JSON.stringify(text.slice(-200)));
+    throw new Error(`reply is not JSON: ${e.message}`);
+  }
 }
 
 // Drop the oldest turns (never the system prompt) when the history grows past the cap.
@@ -107,7 +140,7 @@ function applyTurns(job, messages, turns) {
   for (const t of turns) {
     messages.push({ role: 'user', content: t.user }, { role: 'assistant', content: t.assistant });
     let out = {};
-    try { out = JSON.parse(t.assistant).t || {}; } catch (_) { /* ignore broken turn */ }
+    try { out = parseReply(t.assistant).t || {}; } catch (_) { /* ignore broken turn */ }
     t.indexes.forEach((k, n) => { const v = out[String(n + 1)]; if (typeof v === 'string' && v.trim()) job.texts[k] = v.trim(); });
   }
 }
@@ -132,9 +165,9 @@ async function runJob(job, blocks, title) {
       continue;
     }
     const turns = [];
-    for (let i = seg.from; i < seg.to; i += BATCH) {
-      const indexes = [];
-      for (let k = i; k < Math.min(seg.to, i + BATCH); k++) indexes.push(k);
+    // A failed batch is split in two and each half retried once (as its own turn), so one bad reply
+    // costs a few lines instead of 80 and the segment still reaches the coverage needed for caching.
+    const translateBatch = async (indexes, depth) => {
       try {
         Object.assign(job.texts, await turn(job, messages, turns, indexes, blocks, ++part));
         const missing = indexes.filter((k) => !job.texts[k]);
@@ -142,7 +175,18 @@ async function runJob(job, blocks, title) {
       } catch (e) {
         job.error = String(e.message || e);
         log('batch failed', job.key.slice(0, 8), `${indexes[0]}-${indexes[indexes.length - 1]}`, job.error);
+        if (depth < 2 && indexes.length >= 8) {
+          const half = Math.ceil(indexes.length / 2);
+          log('retrying as two batches', job.key.slice(0, 8));
+          await translateBatch(indexes.slice(0, half), depth + 1);
+          await translateBatch(indexes.slice(half), depth + 1);
+        }
       }
+    };
+    for (let i = seg.from; i < seg.to; i += BATCH) {
+      const indexes = [];
+      for (let k = i; k < Math.min(seg.to, i + BATCH); k++) indexes.push(k);
+      await translateBatch(indexes, 0);
     }
     fresh++;
     let covered = 0;
@@ -177,4 +221,19 @@ function ensure(baseDir, blocks, title) {
   return job;
 }
 
-module.exports = { enabled, ensure, cleanText, MODEL };
+// One stand-alone request that must answer with a JSON object (used by the dictionary endpoint).
+async function chatJson(messages, { maxTokens = 300, temperature = 0.3 } = {}) {
+  const body = { model: MODEL, temperature, max_tokens: maxTokens, response_format: { type: 'json_object' }, messages };
+  if (THINKING) body.thinking = { type: THINKING };
+  const res = await fetch(`${API}/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(20000),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${JSON.stringify(j).slice(0, 160)}`);
+  return parseReply(j.choices[0].message.content);
+}
+
+module.exports = { enabled, ensure, cleanText, chatJson, MODEL };

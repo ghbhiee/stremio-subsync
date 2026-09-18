@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// Stremio subtitles addon: proxies OpenSubtitles v3, aligns every candidate subtitle to the video that is
-// actually being played (found in the local streaming engine) and ranks them. Also offers bilingual
-// (Chinese + English) and machine-translated Chinese tracks.
+// Stremio subtitles addon: proxies OpenSubtitles v3 and, on request, aligns the candidate subtitles to the
+// video that is actually being played (found in the local streaming engine), ranks them, merges Chinese
+// and English into bilingual tracks and machine-translates the best English subtitle into Chinese.
+// Listing subtitles never starts any work: alignment and translation run only through the action
+// endpoint (used by the web UI script, subsync-ui.js) or when a client selects one of the "▶" entries.
 'use strict';
 
 const http = require('http');
@@ -12,6 +14,7 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { align, speechFromRms, parseSrt, formatSrt } = require('./align');
 const translate = require('./translate');
+const dict = require('./dict');
 
 const PORT = Number(process.env.PORT || 11480);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -23,9 +26,10 @@ const CACHE_DIR = process.env.CACHE_DIR || '/var/lib/stremio-subsync';
 const FFMPEG = process.env.FFMPEG_BIN || '/usr/bin/ffmpeg';
 const FFPROBE = process.env.FFPROBE_BIN || '/usr/bin/ffprobe';
 const REF_SECONDS = Number(process.env.REF_SECONDS || 600);
-const LIST_WAIT_MS = Number(process.env.LIST_WAIT_MS || 8000);
-const SUB_WAIT_MS = Number(process.env.SUB_WAIT_MS || 40000);
-const TRANSLATE_WAIT_MS = Number(process.env.TRANSLATE_WAIT_MS || 40000); // browser -> nginx /subtitles.vtt allows 60 s
+// "▶" action entries (native clients) wait this long for a result before serving what is available.
+const ACTION_WAIT_MS = Number(process.env.ACTION_WAIT_MS || 40000);
+// Translation waits this long for a running alignment so it translates the best-aligned English subtitle.
+const TRANSLATE_AFTER_ALIGN_MS = Number(process.env.TRANSLATE_AFTER_ALIGN_MS || 120000);
 const GOOD_CUES = Number(process.env.GOOD_CUES || 0.55);   // cue-start match ratio vs embedded track
 const GOOD_SPEECH = Number(process.env.GOOD_SPEECH || 0.6); // share of subtitle time on detected speech
 const GOOD_CONSENSUS = Number(process.env.GOOD_CONSENSUS || 0.9); // agreement with the consensus subtitle
@@ -39,7 +43,7 @@ const ALIGN_AUDIO = process.env.ALIGN_AUDIO === '1';
 const ENG = new Set(['eng', 'en']);
 const CHI = new Set(['chi', 'zho', 'zht', 'zhs', 'chs', 'cht', 'ze', 'zh']);
 const ALIGN_LANGS = new Set((process.env.ALIGN_LANGS || [...ENG, ...CHI].join(',')).split(','));
-const MT_LANG = process.env.MT_LANG || 'chi';
+const MT_LANG = 'chi'; // every Chinese variant is listed as "chi" so the player shows one 中文 group
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
 
 if (!TOKEN || !PUBLIC_BASE) {
@@ -49,9 +53,9 @@ if (!TOKEN || !PUBLIC_BASE) {
 
 const MANIFEST = {
   id: 'com.tokencv.subsync',
-  version: '1.1.0',
+  version: '1.2.0',
   name: '字幕对齐',
-  description: 'OpenSubtitles 字幕：按正在播放的视频自动对齐时间轴并排序，提供中英双语与 AI 机翻中文字幕',
+  description: 'OpenSubtitles 字幕：按需对齐时间轴并排序，提供中英双语与 AI 翻译中文字幕（对齐和翻译都由用户触发）',
   resources: ['subtitles'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
@@ -78,21 +82,24 @@ async function fetchText(url, timeout = 20000) {
 
 // ---------- video lookup / reference ----------
 
+// The same file can sit in several torrents of the engine (a re-added stream, a REPACK of the same
+// release); prefer an exact file-name match and, among those, the torrent that has downloaded the most.
 async function findVideo(size, filename) {
   const stats = JSON.parse(await fetchText(`${ENGINE}/stats.json`, 5000));
   const base = (filename || '').split('/').pop();
-  let fallback = null;
+  const hits = [];
   for (const [ih, t] of Object.entries(stats)) {
     if (!t || !Array.isArray(t.files)) continue;
     for (let i = 0; i < t.files.length; i++) {
       const f = t.files[i];
       if (size && Number(f.length) !== Number(size)) continue;
-      const hit = { url: `${ENGINE}/${ih}/${i}`, name: f.name, length: Number(f.length) };
-      if (!base || f.name.split('/').pop() === base) return hit;
-      if (size) fallback = fallback || hit;
+      const exact = !base || f.name.split('/').pop() === base;
+      if (!exact && !size) continue;
+      hits.push({ url: `${ENGINE}/${ih}/${i}`, name: f.name, length: Number(f.length), exact, downloaded: Number(t.downloaded) || 0, peers: Number(t.peers) || 0 });
     }
   }
-  return fallback;
+  hits.sort((a, b) => Number(b.exact) - Number(a.exact) || b.downloaded - a.downloaded || b.peers - a.peers);
+  return hits[0] || null;
 }
 
 // Stremio asks for subtitles first with only a file name, then again with videoSize/videoHash, and
@@ -148,7 +155,7 @@ async function buildReference(job) {
   job.ref = { speech: speechFromRms(rms, RMS_BIN), windowEnd: rms.length * RMS_BIN };
 }
 
-// ---------- alignment jobs ----------
+// ---------- jobs (one per video file) ----------
 
 const jobs = new Map(); // videoKey -> job
 const jobsByShortKey = new Map();
@@ -183,9 +190,67 @@ function isGood(r) {
   return r.score >= GOOD_SPEECH;
 }
 
-async function saveResults(job) {
-  await fsp.writeFile(path.join(job.dir, 'results.json'), JSON.stringify({ refMode: job.refMode, results: job.results }, null, 1)).catch(() => {});
+function titleFor(job) {
+  return (job.filename || job.id || '').replace(/\.[a-z0-9]{2,4}$/i, '');
 }
+
+async function saveResults(job) {
+  await fsp.mkdir(job.dir, { recursive: true }).catch(() => {});
+  await fsp.writeFile(path.join(job.dir, 'results.json'), JSON.stringify({ refMode: job.refMode, state: job.align.state, results: job.results }, null, 1)).catch(() => {});
+}
+
+// job.json lets subtitle, status and action requests survive a service restart (the player only asks
+// for the list when the video is opened).
+async function saveJobFile(job) {
+  const data = { key: job.key, size: job.size, filename: job.filename, type: job.type, id: job.id, entries: job.entries || [], mtInfo: job.mtInfo || null, savedAt: new Date().toISOString() };
+  const sig = sha1(JSON.stringify(data.entries) + JSON.stringify(data.mtInfo));
+  if (job.savedSig === sig) return;
+  job.savedSig = sig;
+  await fsp.mkdir(job.dir, { recursive: true }).catch(() => {});
+  await fsp.writeFile(path.join(job.dir, 'job.json'), JSON.stringify(data)).catch((e) => log('job.json write failed', e.message));
+}
+
+function getJob(videoKey, meta = {}) {
+  let job = jobs.get(videoKey);
+  if (job) { for (const [k, v] of Object.entries(meta)) if (v !== undefined && v !== null) job[k] = v; return job; }
+  const dir = path.join(CACHE_DIR, sha1(videoKey));
+  job = {
+    key: videoKey, shortKey: sha1(videoKey).slice(0, 16), dir, results: {}, entries: [], mt: null, mtInfo: null,
+    align: { state: 'idle', phase: '', done: 0, total: 0, startedAt: null, finishedAt: null, error: null },
+    lastRun: 0,
+  };
+  for (const [k, v] of Object.entries(meta)) if (v !== undefined && v !== null) job[k] = v;
+  jobs.set(videoKey, job);
+  jobsByShortKey.set(job.shortKey, job);
+  try {
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, 'results.json'), 'utf8'));
+    Object.assign(job.results, saved.results || {});
+    for (const r of Object.values(job.results)) if (r.status === 'pending') r.status = 'failed'; // interrupted run
+    job.refMode = saved.refMode;
+    if (saved.state === 'done' || (!saved.state && Object.values(job.results).some((r) => r.status === 'done'))) job.align.state = 'done';
+    else if (saved.state === 'noref' || saved.state === 'novideo') job.align.state = saved.state;
+  } catch (_) { /* fresh */ }
+  try {
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, 'job.json'), 'utf8'));
+    if (!job.mtInfo && saved.mtInfo) job.mtInfo = saved.mtInfo;
+    if (!job.entries.length && Array.isArray(saved.entries)) job.entries = saved.entries;
+    for (const k of ['size', 'filename', 'type', 'id']) if (job[k] === undefined && saved[k] !== undefined) job[k] = saved[k];
+  } catch (_) { /* no job file */ }
+  return job;
+}
+
+async function jobByShortKey(shortKey) {
+  if (jobsByShortKey.has(shortKey)) return jobsByShortKey.get(shortKey);
+  if (!/^[0-9a-f]{16}$/.test(shortKey)) return null;
+  const names = await fsp.readdir(CACHE_DIR).catch(() => []);
+  const dirName = names.find((n) => n.length === 40 && n.startsWith(shortKey));
+  if (!dirName) return null;
+  const saved = await fsp.readFile(path.join(CACHE_DIR, dirName, 'job.json'), 'utf8').then(JSON.parse).catch(() => null);
+  if (!saved || !saved.key) return null;
+  return getJob(saved.key, { size: saved.size, filename: saved.filename, type: saved.type, id: saved.id });
+}
+
+// ---------- alignment ----------
 
 async function downloadOriginal(job, entry) {
   await fsp.mkdir(job.dir, { recursive: true });
@@ -205,7 +270,7 @@ async function alignOne(job, entry) {
     await fsp.writeFile(path.join(job.dir, `${key}.times.json`), JSON.stringify(res.aligned));
     await fsp.writeFile(path.join(job.dir, `${key}.srt`), formatSrt(blocks.map((b, i) => ({ ...b, start: res.aligned[i][0], end: res.aligned[i][1] }))));
     Object.assign(r, {
-      cjk: blocks.filter((b) => /[\u3400-\u9fff]/.test(b.text)).length / blocks.length,
+      cjk: blocks.filter((b) => /[㐀-鿿]/.test(b.text)).length / blocks.length,
       status: 'done', refMode: job.refMode, score: res.score, origScore: res.origScore,
       scale: res.scale, offset: res.offset, pieces: new Set(res.pieces.map((p) => p.offset.toFixed(1))).size,
     });
@@ -218,54 +283,47 @@ async function alignOne(job, entry) {
   return r;
 }
 
-function getJob(videoKey, meta) {
-  let job = jobs.get(videoKey);
-  if (job) return job;
-  const dir = path.join(CACHE_DIR, sha1(videoKey));
-  job = { key: videoKey, dir, results: {}, status: 'pending', lastRun: 0, mt: {}, ...meta };
-  jobs.set(videoKey, job);
-  try {
-    const saved = JSON.parse(fs.readFileSync(path.join(dir, 'results.json'), 'utf8'));
-    Object.assign(job.results, saved.results || {});
-    job.refMode = saved.refMode;
-  } catch (_) { /* fresh */ }
-  return job;
+function needsWork(job) {
+  return (job.entries || []).some((e) => ALIGN_LANGS.has(e.lang) && (job.results[subKey(e)] || {}).status !== 'done');
 }
 
-function needsWork(job, entries) {
-  return entries.some((e) => ALIGN_LANGS.has(e.lang) && (job.results[subKey(e)] || {}).status !== 'done');
-}
-
-function runJob(job, entries) {
-  if (job.promise) return job.promise;
-  if (job.status === 'noref') return Promise.resolve();
-  if (UNALIGNED.has(job.status) && Date.now() - job.lastRun < RETRY_AFTER_MS) return Promise.resolve();
-  if (!needsWork(job, entries)) { job.status = 'done'; return Promise.resolve(); }
+// Align every English and Chinese candidate of the video. Runs only when asked (action endpoint or a
+// "▶" entry); the reference (embedded track of the first REF_SECONDS, or the consensus of the
+// candidates) is built once per process and the results are cached on disk.
+function startAlign(job) {
+  if (job.alignPromise) return job.alignPromise;
+  if (!needsWork(job)) { job.align.state = 'done'; return Promise.resolve(); }
+  if (UNALIGNED.has(job.align.state) && Date.now() - job.lastRun < RETRY_AFTER_MS) return Promise.resolve();
   job.lastRun = Date.now();
-  job.status = 'running';
-  job.promise = (async () => {
+  Object.assign(job.align, { state: 'running', phase: 'video', done: 0, total: 0, startedAt: Date.now(), finishedAt: null, error: null });
+  job.alignPromise = (async () => {
     await fsp.mkdir(job.dir, { recursive: true });
     if (!job.ref) {
       const video = await findVideo(job.size, job.filename).catch((e) => { log('engine lookup failed', e.message); return null; });
       if (video) {
         job.videoUrl = video.url;
+        job.align.phase = 'reference';
         await buildReference(job);
       }
-      if (!job.ref) await consensusReference(job, entries);
+      if (!job.ref) { job.align.phase = 'consensus'; await consensusReference(job, job.entries); }
       if (!job.ref) {
-        job.status = video ? 'noref' : 'novideo';
+        job.align.state = video ? 'noref' : 'novideo';
         log(video ? 'no embedded subtitles and no consensus; timings left unchanged' : 'video not in engine and no consensus', job.key);
         return;
       }
       log('reference', job.key, job.refMode, `window=${Math.round(job.ref.windowEnd)}s`);
     }
-    const todo = entries.filter((e) => ALIGN_LANGS.has(e.lang) && (job.results[subKey(e)] || {}).status !== 'done')
+    const todo = job.entries.filter((e) => ALIGN_LANGS.has(e.lang) && (job.results[subKey(e)] || {}).status !== 'done')
       .sort((a, b) => heuristic(job, b) - heuristic(job, a));
-    for (const e of todo) await alignOne(job, e);
-    job.status = 'done';
-  })().catch((e) => { job.status = 'failed'; job.error = String(e.message || e); log('job failed', job.key, job.error); })
-    .finally(() => { job.promise = null; startTranslation(job); });
-  return job.promise;
+    job.align.phase = 'align';
+    job.align.total = todo.length;
+    for (const e of todo) { await alignOne(job, e); job.align.done++; }
+    job.align.state = 'done';
+    const best = bestEntry(job, ENG, { alignedOnly: true });
+    log('aligned', titleFor(job), `${todo.length} subtitles`, best ? `best ${subKey(best)} ${Math.round(job.results[subKey(best)].score * 100)}%` : 'no good english subtitle');
+  })().catch((e) => { job.align.state = 'failed'; job.align.error = String(e.message || e); log('job failed', job.key, job.align.error); })
+    .finally(async () => { job.alignPromise = null; job.align.finishedAt = Date.now(); await saveResults(job); });
+  return job.alignPromise;
 }
 
 // Without an embedded track, use the subtitle that most other candidates agree with (after fitting scale
@@ -325,72 +383,95 @@ async function loadCues(job, entry) {
 
 // ---------- translation / bilingual ----------
 
-function titleFor(job) {
-  return (job.filename || job.id || '').replace(/\.[a-z0-9]{2,4}$/i, '');
+// Start (or join) the machine translation of the best English subtitle. It waits for a running alignment
+// (up to TRANSLATE_AFTER_ALIGN_MS) so the translation lands on the best-aligned subtitle; a translation
+// already on disk (mtInfo) is reused for the same source without any request.
+function ensureTranslation(job, { force = false } = {}) {
+  if (!translate.enabled()) return null;
+  if (job.mt && !force && job.mt.state !== 'failed') return job.mt;
+  const mt = job.mt = { state: 'waiting-align', source: null, entry: null, blocks: null, t: null, startedAt: Date.now(), error: null };
+  mt.promise = (async () => {
+    const cached = !force && job.mtInfo && (job.entries || []).find((e) => subKey(e) === job.mtInfo.source);
+    if (!cached) {
+      const until = Date.now() + TRANSLATE_AFTER_ALIGN_MS;
+      while (job.alignPromise && Date.now() < until) await sleep(500);
+    }
+    const entry = cached || bestEntry(job, ENG);
+    if (!entry) throw new Error('no english subtitle');
+    mt.source = subKey(entry);
+    mt.entry = entry;
+    mt.state = 'running';
+    mt.blocks = parseSrt(await fsp.readFile(await downloadOriginal(job, entry), 'utf8'));
+    if (mt.blocks.length < 5) throw new Error('english subtitle has no cues');
+    mt.t = translate.ensure(path.join(CACHE_DIR, 'translations'), mt.blocks, titleFor(job));
+    await mt.t.promise;
+    const translated = Object.keys(mt.t.texts).length;
+    if (!translated) throw new Error(mt.t.error || 'nothing translated');
+    mt.state = 'done';
+    job.mtInfo = { source: mt.source, cues: mt.blocks.length, translated, at: new Date().toISOString() };
+    await saveJobFile(job);
+  })().catch((e) => { mt.state = 'failed'; mt.error = String(e.message || e); log('translation failed', titleFor(job), mt.error); });
+  return mt;
 }
 
-// Kick off (or join) machine translation of the current best English subtitle.
-async function startTranslation(job) {
-  if (!translate.enabled() || !job.entries) return null;
-  const entry = bestEntry(job, ENG);
-  if (!entry) return null;
-  const key = subKey(entry);
-  if (!job.mt[key]) {
-    job.mt[key] = (async () => {
-      const blocks = parseSrt(await fsp.readFile(await downloadOriginal(job, entry), 'utf8'));
-      return translate.ensure(path.join(CACHE_DIR, 'translations'), blocks, titleFor(job));
-    })().catch((e) => { log('translation start failed', e.message); delete job.mt[key]; return null; });
+// The translation used an English subtitle that alignment later showed to be a poor match while a good
+// one exists: the web UI offers to translate again from the best one.
+function translationStale(job) {
+  const mt = job.mt;
+  if (!mt || mt.state !== 'done' || job.align.state !== 'done') return false;
+  const best = bestEntry(job, ENG, { alignedOnly: true });
+  const r = job.results[mt.source];
+  return Boolean(best && subKey(best) !== mt.source && !(r && r.status === 'done' && isGood(r)));
+}
+
+function translateStatus(job) {
+  if (!translate.enabled()) return { enabled: false, state: 'off' };
+  const mt = job.mt;
+  if (!mt) {
+    const info = job.mtInfo;
+    return { enabled: true, state: info ? 'done' : 'idle', cached: Boolean(info), source: info ? info.source : null, done: info ? info.translated : 0, total: info ? info.cues : 0, coveredUntil: null, stale: false, error: null };
   }
-  return job.mt[key];
+  const texts = mt.t ? mt.t.texts : {};
+  const total = mt.blocks ? mt.blocks.length : 0;
+  let coveredUntil = null;
+  if (mt.blocks) {
+    let i = 0;
+    while (i < total && texts[i]) i++;
+    coveredUntil = i >= total ? null : Math.max(0, mt.blocks[i].start);
+  }
+  return { enabled: true, state: mt.state, cached: Boolean(job.mtInfo), source: mt.source, done: Object.keys(texts).length, total, coveredUntil, stale: translationStale(job), error: mt.error };
 }
 
-async function translationState(job) {
-  const entry = bestEntry(job, ENG);
-  const p = entry && job.mt[subKey(entry)];
-  if (!p) return 'idle';
-  const t = await Promise.race([p, sleep(300).then(() => null)]);
-  return t && t.done ? 'done' : 'running';
-}
-
-async function serveTranslated(res, job, variant) {
-  if (!(job.entries || []).some((e) => ENG.has(e.lang))) return send(res, 404, 'no english subtitle');
-  beginText(res);
-  const deadline = Date.now() + TRANSLATE_WAIT_MS;
-  // Give a running alignment a moment so the translation lands on the best-aligned English subtitle.
-  while (job.promise && !bestEntry(job, ENG, { alignedOnly: true }) && Date.now() < deadline - 25000) await sleep(500);
-  const entry = bestEntry(job, ENG);
-  const t = await startTranslation(job);
-  if (t && !t.done) await Promise.race([t.promise, sleep(Math.max(0, deadline - Date.now()))]);
+async function renderTranslated(job, bi) {
+  const mt = job.mt;
+  const entry = (mt && mt.entry) || bestEntry(job, ENG);
   const cues = await loadCues(job, entry);
-  const zh = (t && t.texts) || {};
+  const zh = (mt && mt.t && mt.t.texts) || {};
   const out = cues.map((c, i) => {
     const en = c.text, cn = zh[i];
-    return { ...c, text: variant === 'mt-zh' ? (cn || en) : (cn ? `${cn}\n${en}` : en) };
+    return { ...c, text: bi ? (cn ? `${cn}\n${en}` : en) : (cn || en) };
   });
-  log('serve', variant, titleFor(job), `${Object.keys(zh).length}/${cues.length} translated`);
-  res.end(formatSrt(out.sort((a, b) => a.start - b.start)));
+  log('serve', bi ? 'mt+bi' : 'mt', titleFor(job), `${Object.keys(zh).length}/${cues.length} translated`);
+  return formatSrt(out.sort((a, b) => a.start - b.start));
 }
 
-async function serveHumanBilingual(res, job) {
-  const en = bestEntry(job, ENG, { alignedOnly: true }), cn = bestEntry(job, CHI, { alignedOnly: true });
-  if (!en || !cn) return send(res, 404, 'needs aligned english and chinese subtitles');
-  beginText(res);
-  const enCues = (await loadCues(job, en)).sort((a, b) => a.start - b.start);
-  const cnCues = (await loadCues(job, cn)).sort((a, b) => a.start - b.start);
+// Attach the text of `other` cues to the `base` cues they overlap (>= 50 % of the shorter cue).
+function mergeBilingual(base, other, { otherFirst = true } = {}) {
+  const a = [...base].sort((x, y) => x.start - y.start), b = [...other].sort((x, y) => x.start - y.start);
   let j = 0;
-  const out = enCues.map((c) => {
-    while (j < cnCues.length && cnCues[j].end <= c.start) j++;
+  return a.map((c) => {
+    while (j < b.length && b[j].end <= c.start) j++;
     const parts = [];
-    for (let k = j; k < cnCues.length && cnCues[k].start < c.end; k++) {
-      const overlap = Math.min(c.end, cnCues[k].end) - Math.max(c.start, cnCues[k].start);
-      if (overlap >= 0.5 * Math.min(c.end - c.start, cnCues[k].end - cnCues[k].start)) parts.push(translate.cleanText(cnCues[k].text));
+    for (let k = j; k < b.length && b[k].start < c.end; k++) {
+      const overlap = Math.min(c.end, b[k].end) - Math.max(c.start, b[k].start);
+      if (overlap >= 0.5 * Math.min(c.end - c.start, b[k].end - b[k].start)) parts.push(translate.cleanText(b[k].text));
     }
-    return { ...c, text: parts.length ? `${[...new Set(parts)].join(' ')}\n${c.text}` : c.text };
+    const extra = [...new Set(parts)].join(' ');
+    return { ...c, text: extra ? (otherFirst ? `${extra}\n${c.text}` : `${c.text}\n${extra}`) : c.text };
   });
-  res.end(formatSrt(out));
 }
 
-// ---------- HTTP ----------
+// ---------- subtitle list ----------
 
 const upstreamCache = new Map();
 
@@ -407,61 +488,70 @@ async function upstreamList(type, id, extra) {
   return list;
 }
 
+function variantTag(entry) {
+  if (entry.lang === 'zht' || entry.lang === 'cht') return '繁体';
+  if (entry.lang === 'ze') return '中英';
+  return '';
+}
+
+// Labels come only from the cache: the player never updates a listed label, so nothing "in progress"
+// is ever written here. Live state is shown by the web UI script.
 function labelFor(job, entry, rank) {
   if (!ALIGN_LANGS.has(entry.lang)) return undefined;
-  const tag = releaseTag(entry);
-  const suffix = tag ? ` · ${tag}` : '';
-  if (job.status === 'noref' || job.status === 'novideo') return `未校验(无可用参考)${suffix}`;
-  if (UNALIGNED.has(job.status)) return `未对齐${suffix}`;
+  const tags = [variantTag(entry), releaseTag(entry)].filter(Boolean);
+  const suffix = tags.length ? ` · ${tags.join(' · ')}` : '';
   const r = job.results[subKey(entry)];
-  if (!r || r.status === 'pending') return `⏳ 对齐中${suffix}`;
-  if (r.status === 'failed') return `✗ 对齐失败${suffix}`;
-  const pct = Math.round((r.score || 0) * 100);
-  const notes = [];
-  if (Math.abs(r.offset || 0) >= 0.5) notes.push(`原偏移${r.offset > 0 ? '+' : ''}${r.offset.toFixed(1)}s`);
-  if (r.scale && Math.abs(r.scale - 1) > 0.01) notes.push('帧率校正');
-  const note = notes.length ? ` · ${notes.join(' ')}` : '';
-  const consensus = (r.refMode || '').startsWith('consensus');
-  if (isGood(r)) return `${rank === 0 ? '✅ 最佳' : '✅ 已对齐'} ${pct}%${consensus ? ' · 多字幕共识' : ''}${note}${suffix}`;
-  return consensus ? `⚠️ 与多数字幕不一致 ${pct}%${suffix}` : `⚠️ 不匹配 ${pct}%${suffix}`;
+  if (r && r.status === 'done') {
+    const pct = Math.round((r.score || 0) * 100);
+    const notes = [];
+    if (Math.abs(r.offset || 0) >= 0.5) notes.push(`原偏移${r.offset > 0 ? '+' : ''}${r.offset.toFixed(1)}s`);
+    if (r.scale && Math.abs(r.scale - 1) > 0.01) notes.push('帧率校正');
+    const note = notes.length ? ` · ${notes.join(' ')}` : '';
+    const consensus = (r.refMode || '').startsWith('consensus');
+    if (isGood(r)) return `${rank === 0 ? '✅ 最佳' : '✅ 已对齐'} ${pct}%${consensus ? ' · 多字幕共识' : ''}${note}${suffix}`;
+    return consensus ? `⚠️ 与多数字幕不一致 ${pct}%${suffix}` : `⚠️ 不匹配 ${pct}%${suffix}`;
+  }
+  if (r && r.status === 'failed') return `✗ 对齐失败${suffix}`;
+  if (job.align.state === 'noref' || job.align.state === 'novideo') return `未对齐 · 无可用参考${suffix}`;
+  return `未对齐${suffix}`;
 }
 
-function subUrl(job, name) {
-  return `${PUBLIC_BASE}/${TOKEN}/sub/${sha1(job.key).slice(0, 16)}/${name}.srt`;
+function subUrl(job, name, query) {
+  return `${PUBLIC_BASE}/${TOKEN}/sub/${job.shortKey}/${name}.srt${query ? `?${query}` : ''}`;
 }
 
-function sortedResponse(job, entries) {
-  const byLang = new Map();
-  for (const e of entries) { if (!byLang.has(e.lang)) byLang.set(e.lang, []); byLang.get(e.lang).push(e); }
+function rankScore(job, e, i) {
+  const r = job.results[subKey(e)];
+  return r && r.status === 'done' ? (isGood(r) ? 2000 : 1000) + (r.score || 0) * 100 : heuristic(job, e) - i * 0.01;
+}
+
+function buildList(job) {
+  const entries = job.entries || [];
+  const groups = new Map();
+  for (const e of entries) {
+    const lang = CHI.has(e.lang) ? MT_LANG : e.lang;
+    if (!groups.has(lang)) groups.set(lang, []);
+    groups.get(lang).push(e);
+  }
+  const hasEng = entries.some((e) => ENG.has(e.lang));
+  const mtLabel = job.mtInfo ? '🤖 AI 中文字幕 ✅' : '🤖 AI 中文字幕（未生成时显示英文）';
+  if (translate.enabled() && hasEng && !groups.has(MT_LANG)) groups.set(MT_LANG, []);
   const out = [];
-  for (const [lang, list] of byLang) {
-    const scored = list.map((e, i) => {
-      const r = job.results[subKey(e)];
-      const s = r && r.status === 'done' ? (isGood(r) ? 2000 : 1000) + (r.score || 0) * 100 : heuristic(job, e) - i * 0.01;
-      return { e, s };
-    }).sort((a, b) => b.s - a.s);
-    scored.forEach(({ e }, rank) => {
-      const aligned = ALIGN_LANGS.has(lang) && !UNALIGNED.has(job.status);
-      const item = { id: `subsync-${subKey(e)}`, lang, url: aligned ? subUrl(job, subKey(e)) : e.url };
-      const label = labelFor(job, e, rank);
-      if (label) item.label = label;
-      out.push(item);
+  for (const [lang, list] of groups) {
+    const managed = ENG.has(lang) || lang === MT_LANG;
+    if (!managed) { for (const e of list) out.push({ id: `subsync-${subKey(e)}`, lang, url: e.url }); continue; }
+    list.map((e, i) => ({ e, s: rankScore(job, e, i) })).sort((a, b) => b.s - a.s).forEach(({ e }, rank) => {
+      out.push({ id: `subsync-${subKey(e)}`, lang, url: subUrl(job, subKey(e)), label: labelFor(job, e, rank) });
     });
+    // Action entries for clients without the web UI; never first in their language, so the player's
+    // automatic selection cannot start work on its own.
+    if (lang === MT_LANG && translate.enabled() && hasEng) {
+      out.push({ id: 'subsync-mt', lang, url: subUrl(job, 'mt'), label: mtLabel });
+      out.push({ id: 'subsync-mt-start', lang, url: subUrl(job, 'mt-start'), label: '▶ 生成 AI 中文字幕（选中即开始，同时对齐）' });
+    }
+    if (ENG.has(lang)) out.push({ id: 'subsync-align', lang, url: subUrl(job, 'align'), label: '▶ 对齐全部字幕（选中即开始）' });
   }
   return out;
-}
-
-async function extraTracks(job, entries) {
-  const items = [];
-  if (bestEntry(job, ENG, { alignedOnly: true }) && bestEntry(job, CHI, { alignedOnly: true })) {
-    items.push({ id: 'subsync-bilingual', lang: MT_LANG, url: subUrl(job, 'bilingual'), label: '🀄 中英双语 · 人工字幕合并' });
-  }
-  if (translate.enabled() && entries.some((e) => ENG.has(e.lang))) {
-    const pending = (await translationState(job)) === 'done' ? '' : ' · 翻译中';
-    items.push({ id: 'subsync-mt-bi', lang: MT_LANG, url: subUrl(job, 'mt-bi'), label: `🤖 中英双语 · AI 翻译${pending}` });
-    items.push({ id: 'subsync-mt-zh', lang: MT_LANG, url: subUrl(job, 'mt-zh'), label: `🤖 中文 · AI 翻译${pending}` });
-  }
-  return items;
 }
 
 async function handleSubtitles(res, type, id, extra) {
@@ -478,35 +568,102 @@ async function handleSubtitles(res, type, id, extra) {
   const videoKey = `${hash}|${size}|${filename}`;
   const job = getJob(videoKey, { size, filename, type, id });
   job.entries = entries;
-  jobsByShortKey.set(sha1(videoKey).slice(0, 16), job);
-  const alignment = runJob(job, entries);
-  if (!job.promise) startTranslation(job); // alignment already settled; otherwise it starts translation when done
-  await Promise.race([alignment, sleep(LIST_WAIT_MS)]);
-  const subtitles = [...await extraTracks(job, entries), ...sortedResponse(job, entries)];
-  send(res, 200, { subtitles, cacheMaxAge: job.status === 'done' ? 3600 : 0 });
+  saveJobFile(job);
+  send(res, 200, { subtitles: buildList(job), cacheMaxAge: 0 });
 }
 
-async function handleSub(res, shortKey, key) {
-  const job = jobsByShortKey.get(shortKey);
+// ---------- subtitle files ----------
+
+async function handleSub(res, shortKey, key, query) {
+  const job = await jobByShortKey(shortKey);
   if (!job) return send(res, 404, 'unknown video');
-  if (key === 'mt-bi' || key === 'mt-zh') return serveTranslated(res, job, key);
-  if (key === 'bilingual') return serveHumanBilingual(res, job);
+  const bi = query.get('bi') === '1';
+  const hasEng = (job.entries || []).some((e) => ENG.has(e.lang));
+  if (key === 'align') { // "▶" entry: start alignment, serve the best English subtitle when done or after ACTION_WAIT_MS
+    const entry = bestEntry(job, ENG) || bestEntry(job, CHI);
+    if (!entry) return send(res, 404, 'nothing to align');
+    beginText(res);
+    await Promise.race([startAlign(job), sleep(ACTION_WAIT_MS)]);
+    const best = ENG.has(entry.lang) ? bestEntry(job, ENG) : bestEntry(job, CHI);
+    return res.end(formatSrt((await loadCues(job, best || entry)).sort((a, b) => a.start - b.start)));
+  }
+  if (key === 'mt-start' || key === 'mt') {
+    if (!translate.enabled()) return send(res, 404, 'translation disabled');
+    if (!hasEng) return send(res, 404, 'no english subtitle');
+    beginText(res);
+    if (key === 'mt-start') { // "▶" entry: start alignment and translation, wait a while for the result
+      startAlign(job);
+      const mt = ensureTranslation(job);
+      await Promise.race([mt.promise, sleep(ACTION_WAIT_MS)]);
+    } else if (!job.mt && job.mtInfo) { // translation on disk: load it (no API requests)
+      await Promise.race([ensureTranslation(job).promise, sleep(15000)]);
+    }
+    return res.end(await renderTranslated(job, bi));
+  }
   const entry = (job.entries || []).find((e) => subKey(e) === key);
   if (!entry) return send(res, 404, 'unknown subtitle');
   beginText(res);
-  const deadline = Date.now() + SUB_WAIT_MS;
-  while (Date.now() < deadline) {
-    const r = job.results[key];
-    if ((r && r.status !== 'pending') || UNALIGNED.has(job.status)) break;
-    if (!job.promise) runJob(job, job.entries);
-    if (!job.promise) break;
-    await sleep(500);
+  let cues = await loadCues(job, entry);
+  if (bi && CHI.has(entry.lang)) {
+    const en = bestEntry(job, ENG);
+    if (en) cues = mergeBilingual(cues, await loadCues(job, en), { otherFirst: false });
   }
-  const aligned = path.join(job.dir, `${key}.srt`), orig = path.join(job.dir, `${key}.orig.srt`);
-  const r = job.results[key];
-  const file = r && r.status === 'done' && fs.existsSync(aligned) ? aligned : (fs.existsSync(orig) ? orig : null);
-  res.end(file ? await fsp.readFile(file, 'utf8') : await fetchText(entry.url, 30000));
+  res.end(formatSrt(cues.sort((a, b) => a.start - b.start)));
 }
+
+// ---------- status / actions (web UI) ----------
+
+function statusOf(job) {
+  const subs = {};
+  for (const e of job.entries || []) {
+    if (!ALIGN_LANGS.has(e.lang)) continue;
+    const r = job.results[subKey(e)] || null;
+    subs[subKey(e)] = {
+      lang: CHI.has(e.lang) ? MT_LANG : 'eng',
+      status: r ? r.status : 'none',
+      score: r && r.status === 'done' ? Math.round(r.score * 100) / 100 : null,
+      good: Boolean(r && r.status === 'done' && isGood(r)),
+      label: labelFor(job, e, null),
+    };
+  }
+  const bestEn = bestEntry(job, ENG, { alignedOnly: true }), bestZh = bestEntry(job, CHI, { alignedOnly: true });
+  return {
+    ok: true, key: job.shortKey, title: titleFor(job),
+    align: { ...job.align, refMode: job.refMode || null, running: Boolean(job.alignPromise) },
+    translate: translateStatus(job),
+    best: { en: bestEn ? subKey(bestEn) : null, zh: bestZh ? subKey(bestZh) : null },
+    hasHumanZh: (job.entries || []).some((e) => CHI.has(e.lang)),
+    hasEng: (job.entries || []).some((e) => ENG.has(e.lang)),
+    subs,
+  };
+}
+
+function readBody(req, limit = 4096) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > limit) { reject(new Error('body too large')); req.destroy(); } });
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
+}
+
+async function handleAction(req, res, shortKey) {
+  const job = await jobByShortKey(shortKey);
+  if (!job) return send(res, 404, { error: 'unknown video' });
+  let body = {};
+  try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) { return send(res, 400, { error: 'bad json' }); }
+  const wantAlign = Boolean(body.align || body.translate || body.bilingual);
+  const wantTranslate = Boolean(body.translate || body.bilingual);
+  if (wantAlign) startAlign(job);
+  if (wantTranslate) {
+    if (!translate.enabled()) return send(res, 400, { error: 'translation disabled', ...statusOf(job) });
+    ensureTranslation(job, { force: Boolean(body.force) });
+  }
+  log('action', titleFor(job), JSON.stringify(body));
+  send(res, 200, statusOf(job));
+}
+
+// ---------- HTTP plumbing ----------
 
 // The streaming engine fetches subtitle files with a 10 s timeout that is cleared once response headers
 // arrive, so send them right away and deliver the body when alignment or translation is ready.
@@ -521,6 +678,8 @@ function send(res, code, body, type) {
   res.writeHead(code, {
     'content-type': type || (isText ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8'),
     'access-control-allow-origin': '*',
+    'access-control-allow-headers': 'content-type',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
     'cache-control': 'no-store',
   });
   res.end(isText ? body : JSON.stringify(body));
@@ -531,7 +690,7 @@ http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const parts = url.pathname.split('/').filter(Boolean);
     if (req.method === 'OPTIONS') return send(res, 204, '');
-    if (parts[0] === 'health') return send(res, 200, { ok: true, jobs: jobs.size, translation: translate.enabled() ? translate.MODEL : false });
+    if (parts[0] === 'health') return send(res, 200, { ok: true, version: MANIFEST.version, jobs: jobs.size, translation: translate.enabled() ? translate.MODEL : false });
     if (parts[0] !== TOKEN) return send(res, 404, 'not found');
     const rest = parts.slice(1);
     if (rest[0] === 'manifest.json') return send(res, 200, MANIFEST);
@@ -542,11 +701,22 @@ http.createServer(async (req, res) => {
       const extra = rawExtra.join('/').replace(/\.json$/, '');
       return await handleSubtitles(res, rest[1], id, extra);
     }
-    if (rest[0] === 'sub' && rest.length === 3) return await handleSub(res, rest[1], rest[2].replace(/\.srt$/, ''));
+    if (rest[0] === 'sub' && rest.length === 3) return await handleSub(res, rest[1], rest[2].replace(/\.srt$/, ''), url.searchParams);
+    if (rest[0] === 'status' && rest.length === 2) {
+      const job = await jobByShortKey(rest[1]);
+      return job ? send(res, 200, statusOf(job)) : send(res, 404, { error: 'unknown video' });
+    }
+    if (rest[0] === 'action' && rest.length === 2 && req.method === 'POST') return await handleAction(req, res, rest[1]);
+    if (rest[0] === 'dict') {
+      const q = (url.searchParams.get('q') || '').trim().slice(0, 200);
+      const ctx = (url.searchParams.get('ctx') || '').trim().slice(0, 600);
+      if (!q) return send(res, 400, { error: 'q required' });
+      return send(res, 200, await dict.lookup(q, ctx));
+    }
     send(res, 404, 'not found');
   } catch (e) {
     log('request error', req.url.replace(TOKEN, '<token>'), e.message);
     if (!res.headersSent) send(res, 500, { error: 'internal error' });
     else res.end();
   }
-}).listen(PORT, HOST, () => log(`subsync listening on http://${HOST}:${PORT} (translation: ${translate.enabled() ? translate.MODEL : 'off'})`));
+}).listen(PORT, HOST, () => log(`subsync ${MANIFEST.version} listening on http://${HOST}:${PORT} (translation: ${translate.enabled() ? translate.MODEL : 'off'})`));

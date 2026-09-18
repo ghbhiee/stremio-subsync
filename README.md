@@ -1,31 +1,39 @@
 # stremio-subsync · 字幕对齐
 
-自建的 Stremio 字幕插件（addon）：从 OpenSubtitles 拿字幕，**按你正在播放的那个视频文件自动校正时间轴并按匹配度排序**，还能生成**中英双语**和 **AI 机翻中文**字幕。
+自建的 Stremio 字幕插件（addon）：从 OpenSubtitles 拿字幕，**按你正在播放的那个视频文件校正时间轴并按匹配度排序**，能合成**中英双语**字幕，也能用 AI 把英文字幕翻成中文。配套一段注入自托管 stremio-web 的脚本，在播放器里提供双语开关、一键对齐/生成、完成通知、点词查词和逐句快捷键。
 
-A self-hosted Stremio subtitles addon that aligns OpenSubtitles subtitles to the exact video being played, ranks them, and adds bilingual / AI-translated Chinese tracks.
+A self-hosted Stremio subtitles addon that aligns OpenSubtitles subtitles to the exact video being played, ranks them, merges Chinese and English into bilingual tracks and machine-translates English into Chinese on demand, plus a web-player companion script (bilingual switch, notifications, click-to-look-up words, sentence navigation keys).
 
 ## 功能
 
-- **自动对齐 + 排序**：用视频文件里自带的字幕轨（图形或文字字幕都行）当标准，为每个字幕拟合「帧率比例 × 时间 + 偏移」并分段微调。能校正固定偏移（如 DVD 加长版晚十几秒）和帧率不同导致的越播越偏（25 ↔ 23.976 fps）。视频没有自带字幕轨时（例如很多 MP4），改用**多字幕共识**：候选字幕两两比对，取和其他字幕最一致的那个当标准，把另类标出来。菜单里第一个就是最准的，标签写明匹配度和做过的校正，例如 `✅ 最佳 98% · BluRay`、`✅ 已对齐 68% · 原偏移-15.4s · DVD`、`⚠️ 不匹配 39%`、`⚠️ 与多数字幕不一致 70%`。
-- **AI 翻译（可选）**：把最准的英文字幕翻成简体中文，提供 `🤖 中英双语` 和 `🤖 中文` 两条字幕。默认用 DeepSeek `deepseek-flash`（关闭思考模式）。整份字幕作为**同一段多轮对话**按时间顺序逐批翻译，每次请求都带上之前全部原文和译文，人名、称呼、梗前后一致；历史前缀逐字节不变，几乎全部命中服务商的上下文缓存。按时间轴每 20 分钟一段存盘（连同原始对话轮次），同一份字幕只花一次 token，中断后能用同样的缓存前缀续翻。
-- **人工中英双语**：OpenSubtitles 上有能对齐的中文字幕时，自动与英文逐句合并成双语字幕。
-- **自动预装（可选）**：自托管 stremio-web 时，可在网页里注入一段脚本，自动装好 Torrentio、MediaFusion 和本插件，并卸掉被本插件替代的 OpenSubtitles v3。
+- **按需对齐 + 排序**：打开视频只列出字幕，不做任何处理；点「开始对齐」才用视频自带的字幕轨当标准，为每个英文/中文字幕拟合「帧率比例 × 时间 + 偏移」并分段微调。能校正固定偏移（如 DVD 加长版晚十几秒）和帧率不同导致的越播越偏（25 ↔ 23.976 fps）。视频没有自带字幕轨时（例如很多 MP4），改用**多字幕共识**。对齐过的视频下次打开时菜单第一个就是最准的，标签写明匹配度和做过的校正，例如 `✅ 最佳 98% · BluRay`、`✅ 已对齐 68% · 原偏移-15.4s · DVD`、`⚠️ 不匹配 39%`。
+- **AI 翻译（可选，手动触发）**：点「生成」把最准的英文字幕翻成简体中文。默认用 DeepSeek `deepseek-flash`（关闭思考模式），整份字幕作为同一段多轮对话按时间顺序逐批翻译，人名、称呼、梗前后一致，历史前缀逐字节不变以命中上下文缓存；按 20 分钟一段存盘，同一份字幕只花一次 token。模型偶尔在 JSON 后面多吐字或整批答非所问时，会截取第一个完整对象、再把这一批拆成两半重试。
+- **中英双语开关**：中文栏最上面有「中英双语」开关。无论选的是人工中文字幕还是 AI 中文字幕，打开就显示中文在上、英文在下；没有中文字幕时打开开关，会自动生成 AI 中文字幕并同时对齐，完成后自动切换。
+- **不打断播放**：对齐、翻译都在后台跑，期间照常看（先用原始字幕）；完成后右上角弹通知，并把当前字幕换成对齐/翻译好的版本。如果发现正在看的字幕和视频不匹配而另一条匹配，会自动切到最佳的那条并提示。
+- **英文第一、中文第二**：语言列表固定这个顺序，界面语言不用改。
+- **点词查词**：鼠标停在字幕上自动暂停（可关），点英文单词弹出有道词典释义（音标、词性、中文），配置了翻译模型时再补一行「这句话里的意思」和整句翻译；拖选多个词可以查短语。
+- **逐句快捷键**：显示字幕时 `A` 回到上一句、`S` 重听本句、`D` 下一句（没有字幕时这三个键保持 Stremio 原来的功能）。
+- **原生客户端兜底**：没有注入脚本的 Stremio 客户端（Mac、手机、电视）在英文列表末尾能看到「▶ 对齐全部字幕」、中文列表末尾能看到「▶ 生成 AI 中文字幕」，选中即开始，稍后重新选一次字幕就能拿到结果。
+- **自动预装（可选）**：自托管 stremio-web 时，注入脚本自动装好 Torrentio、MediaFusion 和本插件，并卸掉被本插件替代的 OpenSubtitles v3。
 
 ## 工作原理
 
-1. Stremio 播放时向插件请求字幕，附带文件名、OpenSubtitles 哈希和文件大小。
-2. 插件用同样的参数请求 OpenSubtitles v3（`opensubtitles-v3.strem.io`），拿到字幕列表。
-3. 按文件大小和文件名，在同机的 Stremio streaming server（`127.0.0.1:11470`）里找到正在播放的文件，用 `ffprobe` 读出内嵌字幕轨前 10 分钟每句的时间；没有内嵌字幕轨时，用候选字幕的多数共识时间轴当参考。
-   Stremio 会先只带文件名请求一次、拿到哈希后再请求一次，而 stremio-web 按「插件地址 + 列表序号」给字幕编号、重复编号只保留先到的。所以插件会通过 streaming server 补算只带文件名请求的文件大小和哈希，让两次返回完全相同的列表；补算不出来时返回空列表，由带哈希的那次补全，避免丢字幕。
-4. 对英文、中文字幕逐个对齐打分（每个约 20 ms），结果缓存在 `/var/lib/stremio-subsync`。
-5. 播放器选中某条字幕时，由 streaming server 的 `/subtitles.vtt?from=` 到插件取已校正的 SRT。
+1. Stremio 播放时向插件请求字幕列表，插件用同样的参数请求 OpenSubtitles v3，把所有中文变体归成一个「中文」组，按缓存里的对齐结果排序、打标签后返回。**列表请求不做任何处理。**
+   Stremio 会先只带文件名请求一次、拿到哈希后再请求一次，而 stremio-web 按「插件地址 + 列表序号」给字幕编号、重复编号只保留先到的。插件会通过 streaming server 补算只带文件名请求的文件大小和哈希，让两次返回完全相同的列表。
+2. 所有英文、中文字幕的 URL 都指向插件（`/sub/<视频>/<字幕>.srt`）：没对齐返回原始字幕，对齐完返回校正版；加 `?bi=1` 返回和最佳英文合并的双语版；`mt.srt` 是 AI 中文字幕。
+3. 网页脚本（`subsync-ui.js`）通过 `/status/<视频>` 轮询进度，通过 `/action/<视频>` 触发对齐或翻译；完成后用播放器的 `addExtraSubtitlesTracks` 加一条新字幕并选中，实现不刷新页面的热替换。
+4. 对齐时按文件大小和文件名，在同机的 Stremio streaming server（`127.0.0.1:11470`）里找到正在播放的文件（同一文件在多个种子里时选下载最多的那个），用 `ffprobe` 读内嵌字幕轨前 10 分钟每句的时间；没有内嵌字幕轨时用候选字幕的多数共识时间轴当参考。对英文、中文字幕逐个对齐打分（每个约 20 ms），结果缓存在 `/var/lib/stremio-subsync`。
+5. 翻译和对齐可以并行：翻译只处理文本，出字幕时再套用对应英文字幕的对齐时间轴。翻译会等正在跑的对齐最多两分钟，好选中对齐分最高的英文字幕当源。
+6. 查词走 `/dict?q=<词>&ctx=<句子>`：有道词典的公开接口给音标和释义，翻译模型（配置了才用）给语境释义和整句翻译，都查不到时退到 MyMemory。
 
 ## 限制
 
-- **内嵌字幕轨是最可靠的参考**（很多 MKV 片源都带）。没有时用多字幕共识：它只能说明这些字幕彼此一致，不能保证和视频一致（比如候选字幕都来自另一个剪辑版本）。候选太少或各说各的时不改时间，只按片源版本排序，并标 `未校验(无可用参考)`。OpenSubtitles 的「按哈希匹配」标记和语言代码都可能不准（实测一部电影 90 个字幕全标为哈希匹配，`zhe` 字幕其实是越南语），所以中文字幕会检查内容里是否真有汉字。基于音量的人声检测对情景喜剧的笑声、配乐无效，会把准的字幕改错，所以音频对齐默认关闭（`ALIGN_AUDIO=1` 可试）。
-- 必须和 Stremio streaming server 装在**同一台机器**上（要读正在播放的文件）。
-- 第一次看某个视频时，需要先下载前约 10 分钟才能对齐完。AI 翻译是串行的：一集电视剧约 20 秒，两小时电影约一分半（前面的段先翻好）；请求字幕列表时就会在后台开始翻。播放器只加载一次字幕文件，若当时还没翻完，没翻到的句子先显示英文，切到别的字幕再切回来即可刷新。
-- 只对英文和中文做对齐与翻译，其他语言原样透传。
+- **内嵌字幕轨是最可靠的参考**（很多 MKV 片源都带）。没有时用多字幕共识：它只能说明这些字幕彼此一致，不能保证和视频一致。候选太少或各说各的时不改时间。OpenSubtitles 的「按哈希匹配」标记和语言代码都可能不准，所以中文字幕会检查内容里是否真有汉字。基于音量的人声检测对情景喜剧的笑声、配乐无效，默认关闭（`ALIGN_AUDIO=1` 可试）。
+- 必须和 Stremio streaming server 装在**同一台机器**上（要读正在播放的文件）。第一次对齐某个视频时需要先下载前约 10 分钟。
+- 播放器给字幕的标签在加进菜单后不会再变，所以列表里只写缓存里已知的结果；本次会话里的进度和结果由网页脚本显示。原生客户端没有通知，选中「▶」条目后要过一会儿重选字幕。
+- 有字幕显示时 `A`/`S`/`D` 被逐句导航占用，Stremio 原来的音频菜单、字幕菜单、统计菜单用工具栏按钮打开。
+- 只对英文和中文做对齐、翻译与查词，其他语言原样透传。
+- 部署会重启服务：正在跑的对齐/翻译会中断（磁盘缓存不丢），重新点一次即可。
 
 ## 实测
 
@@ -39,7 +47,7 @@ A self-hosted Stremio subtitles addon that aligns OpenSubtitles subtitles to the
 | UNCUT DVDRip × 2 | 19–20% | −15.4 / −15.7 s | 68% |
 | 其他版本 | 27% | — | 39%（标为不匹配） |
 
-AI 翻译同一集 408 句（带上下文串行）：21 秒，6 次请求；输入里缓存命中 27.9k、未命中 5.9k tokens，输出 4.3k tokens。未命中部分和各批独立翻译时（6.2k）基本持平，多出来的全是按缓存价计费的历史。再次播放直接读缓存，0 次请求。
+片源已经下载好时，这 7 条字幕从点「开始对齐」到通知弹出约 2 秒。AI 翻译同一集 408 句：约 20 秒、6 次请求；再次播放直接读缓存，0 次请求。
 
 ## 安装
 
@@ -56,13 +64,27 @@ sudo PUBLIC_BASE=https://media.example.com/subsync \
 ```
 
 - `PUBLIC_BASE`（必填）：插件对外的地址前缀，路径部分会成为 nginx 的 location。
-- `DEEPSEEK_API_KEY`：填了才启用 AI 翻译，保存在 `/etc/stremio/subsync.env`（权限 640），不会打印。
+- `DEEPSEEK_API_KEY`：填了才启用 AI 翻译和语境释义，保存在 `/etc/stremio/subsync.env`（权限 640），不会打印。
 - `NGINX_SNIPPET`：一个已被 HTTPS server 块 include 的 nginx 文件，脚本会追加 `examples/nginx-subsync.conf` 并在 `nginx -t` 通过后 reload。不填就手动把示例加进你的配置。
-- `WEB_DIR`：自托管 stremio-web 的目录，填了才注入自动预装脚本。
+- `WEB_DIR`：自托管 stremio-web 的目录，填了才把预装脚本和播放器脚本（`subsync-ui.js`）挂进 `index.html`。不填也能用插件本身，只是没有开关、通知、查词和快捷键。
 
 装好后，在 Stremio 的 Addons 页面安装 `PUBLIC_BASE/<SUBSYNC_TOKEN>/manifest.json`，token 在 `/etc/stremio/subsync.env` 里。**这个地址本身就是访问凭证，不要公开。** 其余配置项见 `examples/subsync.env.example`。
 
 升级：`git pull` 后用同样的命令再跑一次 `deploy.sh`（幂等，已有的 token 和 key 保留）。
+
+## 接口（供二次开发）
+
+都在 `PUBLIC_BASE/<token>/` 下：
+
+| 路径 | 说明 |
+|---|---|
+| `manifest.json`、`subtitles/<type>/<id>/<extra>.json` | Stremio 插件协议 |
+| `sub/<video>/<key>.srt[?bi=1]` | 字幕文件；`key` 为 OpenSubtitles 字幕 id、`mt`（AI 中文）、`align` / `mt-start`（原生客户端的动作条目） |
+| `status/<video>` | 对齐、翻译进度和每条字幕的结果 |
+| `action/<video>`（POST JSON） | `{"align":true}`、`{"translate":true}`、`{"bilingual":true}`（对齐 + 翻译）、加 `"force":true` 用当前最佳英文重新翻译 |
+| `dict?q=<词>&ctx=<句子>` | 查词 |
+
+`<video>` 是列表里字幕 URL 中的 16 位视频键。
 
 ## License
 
