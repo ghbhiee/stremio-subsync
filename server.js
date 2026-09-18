@@ -12,7 +12,7 @@ const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
-const { align, speechFromRms, parseSrt, formatSrt } = require('./align');
+const { align, cueMatch, speechFromRms, parseSrt, formatSrt } = require('./align');
 const translate = require('./translate');
 const dict = require('./dict');
 
@@ -33,6 +33,10 @@ const TRANSLATE_AFTER_ALIGN_MS = Number(process.env.TRANSLATE_AFTER_ALIGN_MS || 
 const GOOD_CUES = Number(process.env.GOOD_CUES || 0.55);   // cue-start match ratio vs embedded track
 const GOOD_SPEECH = Number(process.env.GOOD_SPEECH || 0.6); // share of subtitle time on detected speech
 const GOOD_CONSENSUS = Number(process.env.GOOD_CONSENSUS || 0.9); // agreement with the consensus subtitle
+// A subtitle that merges or splits lines differently from the reference (every translation does) covers
+// fewer reference cues although it is in sync: accept it when its own cues sit on reference cues.
+const GOOD_SYNC = Number(process.env.GOOD_SYNC || 0.85);   // share of its cues that start on a reference cue
+const MIN_COVER = Number(process.env.MIN_COVER || 0.45);   // ...while still covering this share of the reference
 const CONSENSUS_CANDIDATES = Number(process.env.CONSENSUS_CANDIDATES || 6);
 const CONSENSUS_WINDOW = 1200; // seconds compared when picking the consensus subtitle
 const RETRY_AFTER_MS = 60000;
@@ -185,9 +189,15 @@ function heuristic(job, entry) {
 
 function isGood(r) {
   const mode = r.refMode || '';
-  if (mode.startsWith('embedded')) return r.score >= GOOD_CUES;
-  if (mode.startsWith('consensus')) return r.score >= GOOD_CONSENSUS;
+  const inSync = typeof r.rscore === 'number' && r.rscore >= GOOD_SYNC && r.score >= MIN_COVER;
+  if (mode.startsWith('embedded')) return r.score >= GOOD_CUES || inSync;
+  if (mode.startsWith('consensus')) return r.score >= GOOD_CONSENSUS || inSync;
   return r.score >= GOOD_SPEECH;
+}
+
+// In sync but only a small part of the dialogue (forced / foreign-parts-only subtitles).
+function isPartial(r) {
+  return typeof r.rscore === 'number' && r.rscore >= GOOD_SYNC && r.score < MIN_COVER;
 }
 
 function titleFor(job) {
@@ -230,6 +240,7 @@ function getJob(videoKey, meta = {}) {
     if (saved.state === 'done' || (!saved.state && Object.values(job.results).some((r) => r.status === 'done'))) job.align.state = 'done';
     else if (saved.state === 'noref' || saved.state === 'novideo') job.align.state = saved.state;
   } catch (_) { /* fresh */ }
+  backfillSync(job);
   try {
     const saved = JSON.parse(fs.readFileSync(path.join(dir, 'job.json'), 'utf8'));
     if (!job.mtInfo && saved.mtInfo) job.mtInfo = saved.mtInfo;
@@ -237,6 +248,27 @@ function getJob(videoKey, meta = {}) {
     for (const k of ['size', 'filename', 'type', 'id']) if (job[k] === undefined && saved[k] !== undefined) job[k] = saved[k];
   } catch (_) { /* no job file */ }
   return job;
+}
+
+// Results cached before `rscore` existed: with a consensus reference (a subtitle file on disk) it can be
+// computed now, so videos aligned earlier lose their false "does not match" marks without a new run.
+function backfillSync(job) {
+  const m = /^consensus:(.+)$/.exec(job.refMode || '');
+  if (!m || !Object.values(job.results).some((r) => r.status === 'done' && typeof r.rscore !== 'number')) return;
+  try {
+    const starts = (key) => {
+      const blocks = parseSrt(fs.readFileSync(path.join(job.dir, `${key}.orig.srt`), 'utf8'));
+      let times = null;
+      try { times = JSON.parse(fs.readFileSync(path.join(job.dir, `${key}.times.json`), 'utf8')); } catch (_) { /* reference itself */ }
+      return blocks.map((b, i) => (times && times.length === blocks.length ? times[i][0] : b.start)).sort((a, b) => a - b);
+    };
+    const ref = parseSrt(fs.readFileSync(path.join(job.dir, `${m[1]}.orig.srt`), 'utf8')).map((b) => b.start).sort((a, b) => a - b);
+    if (ref.length < 20) return;
+    for (const r of Object.values(job.results)) {
+      if (r.status !== 'done' || typeof r.rscore === 'number') continue;
+      try { const mine = starts(r.key); r.rscore = mine.length >= 5 ? cueMatch(mine, ref, 1, 0, 0.4) : 0; } catch (_) { /* file gone */ }
+    }
+  } catch (_) { /* reference file gone: keep the old verdicts */ }
 }
 
 async function jobByShortKey(shortKey) {
@@ -271,7 +303,7 @@ async function alignOne(job, entry) {
     await fsp.writeFile(path.join(job.dir, `${key}.srt`), formatSrt(blocks.map((b, i) => ({ ...b, start: res.aligned[i][0], end: res.aligned[i][1] }))));
     Object.assign(r, {
       cjk: blocks.filter((b) => /[㐀-鿿]/.test(b.text)).length / blocks.length,
-      status: 'done', refMode: job.refMode, score: res.score, origScore: res.origScore,
+      status: 'done', refMode: job.refMode, score: res.score, rscore: res.rscore, origScore: res.origScore,
       scale: res.scale, offset: res.offset, pieces: new Set(res.pieces.map((p) => p.offset.toFixed(1))).size,
     });
   } catch (e) {
@@ -358,12 +390,15 @@ async function consensusReference(job, entries) {
   job.ref = { cues: best.cues, windowEnd: best.cues[best.cues.length - 1][1] };
 }
 
+// Between equally good Chinese subtitles prefer Simplified over Traditional.
+function tradPenalty(entry) { return entry.lang === 'zht' || entry.lang === 'cht' ? 0.005 : 0; }
+
 // Best subtitle of a language: highest aligned score if alignment finished, else the heuristic favourite.
 function bestEntry(job, langs, { alignedOnly = false } = {}) {
   const list = (job.entries || []).filter((e) => langs.has(e.lang));
   const aligned = list.map((e) => ({ e, r: job.results[subKey(e)] }))
     .filter((x) => x.r && x.r.status === 'done' && isGood(x.r) && (langs !== CHI || (x.r.cjk || 0) >= 0.3))
-    .sort((a, b) => b.r.score - a.r.score);
+    .sort((a, b) => (b.r.score - tradPenalty(b.e)) - (a.r.score - tradPenalty(a.e)));
   if (aligned.length) return aligned[0].e;
   if (alignedOnly || !list.length) return null;
   return list.map((e, i) => ({ e, s: heuristic(job, e) - i * 0.01 })).sort((a, b) => b.s - a.s)[0].e;
@@ -449,7 +484,7 @@ async function renderTranslated(job, bi) {
   const zh = (mt && mt.t && mt.t.texts) || {};
   const out = cues.map((c, i) => {
     const en = c.text, cn = zh[i];
-    return { ...c, text: bi ? (cn ? `${cn}\n${en}` : en) : (cn || en) };
+    return { ...c, text: bi ? (cn ? `${en}\n${cn}` : en) : (cn || en) };
   });
   log('serve', bi ? 'mt+bi' : 'mt', titleFor(job), `${Object.keys(zh).length}/${cues.length} translated`);
   return formatSrt(out.sort((a, b) => a.start - b.start));
@@ -494,26 +529,29 @@ function variantTag(entry) {
   return '';
 }
 
-// Labels come only from the cache: the player never updates a listed label, so nothing "in progress"
-// is ever written here. Live state is shown by the web UI script.
-function labelFor(job, entry, rank) {
-  if (!ALIGN_LANGS.has(entry.lang)) return undefined;
+// A listed label is never updated by the player, and a long status in front hides what the entry is. So
+// the label is the entry's name (language, variant, release) and a warning follows only when alignment
+// found a problem; nothing is said about subtitles that are fine or were never aligned. The web UI shows
+// the warning on the second line of the entry instead.
+function titleOf(entry) {
   const tags = [variantTag(entry), releaseTag(entry)].filter(Boolean);
-  const suffix = tags.length ? ` · ${tags.join(' · ')}` : '';
+  return `${CHI.has(entry.lang) ? '中文' : 'English'}${tags.length ? ` · ${tags.join(' · ')}` : ''}`;
+}
+
+function warningOf(job, entry) {
   const r = job.results[subKey(entry)];
-  if (r && r.status === 'done') {
-    const pct = Math.round((r.score || 0) * 100);
-    const notes = [];
-    if (Math.abs(r.offset || 0) >= 0.5) notes.push(`原偏移${r.offset > 0 ? '+' : ''}${r.offset.toFixed(1)}s`);
-    if (r.scale && Math.abs(r.scale - 1) > 0.01) notes.push('帧率校正');
-    const note = notes.length ? ` · ${notes.join(' ')}` : '';
-    const consensus = (r.refMode || '').startsWith('consensus');
-    if (isGood(r)) return `${rank === 0 ? '✅ 最佳' : '✅ 已对齐'} ${pct}%${consensus ? ' · 多字幕共识' : ''}${note}${suffix}`;
-    return consensus ? `⚠️ 与多数字幕不一致 ${pct}%${suffix}` : `⚠️ 不匹配 ${pct}%${suffix}`;
-  }
-  if (r && r.status === 'failed') return `✗ 对齐失败${suffix}`;
-  if (job.align.state === 'noref' || job.align.state === 'novideo') return `未对齐 · 无可用参考${suffix}`;
-  return `未对齐${suffix}`;
+  if (!r) return '';
+  if (r.status === 'failed') return '✗ 对齐失败';
+  if (r.status !== 'done' || isGood(r)) return '';
+  if (isPartial(r)) return '⚠️ 只含部分对白';
+  const pct = Math.round(Math.max(r.score || 0, r.rscore || 0) * 100);
+  return (r.refMode || '').startsWith('consensus') ? `⚠️ 与多数字幕不一致 ${pct}%` : `⚠️ 与视频不匹配 ${pct}%`;
+}
+
+function labelFor(job, entry) {
+  if (!ALIGN_LANGS.has(entry.lang)) return undefined;
+  const warn = warningOf(job, entry);
+  return warn ? `${titleOf(entry)} · ${warn}` : titleOf(entry);
 }
 
 function subUrl(job, name, query) {
@@ -522,7 +560,7 @@ function subUrl(job, name, query) {
 
 function rankScore(job, e, i) {
   const r = job.results[subKey(e)];
-  return r && r.status === 'done' ? (isGood(r) ? 2000 : 1000) + (r.score || 0) * 100 : heuristic(job, e) - i * 0.01;
+  return (r && r.status === 'done' ? (isGood(r) ? 2000 : 1000) + (r.score || 0) * 100 : heuristic(job, e) - i * 0.01) - tradPenalty(e) * 100;
 }
 
 function buildList(job) {
@@ -534,22 +572,33 @@ function buildList(job) {
     groups.get(lang).push(e);
   }
   const hasEng = entries.some((e) => ENG.has(e.lang));
-  const mtLabel = job.mtInfo ? '🤖 AI 中文字幕 ✅' : '🤖 AI 中文字幕（未生成时显示英文）';
-  if (translate.enabled() && hasEng && !groups.has(MT_LANG)) groups.set(MT_LANG, []);
+  const canTranslate = translate.enabled() && hasEng;
+  // The AI tracks are listed only once they exist: an entry that shows English until someone generates
+  // it is clutter. Without any Chinese entry the 中文 group simply is not there yet (the web UI bar and
+  // the "▶" entry start the generation).
+  if (canTranslate && job.mtInfo && !groups.has(MT_LANG)) groups.set(MT_LANG, []);
   const out = [];
   for (const [lang, list] of groups) {
     const managed = ENG.has(lang) || lang === MT_LANG;
     if (!managed) { for (const e of list) out.push({ id: `subsync-${subKey(e)}`, lang, url: e.url }); continue; }
-    list.map((e, i) => ({ e, s: rankScore(job, e, i) })).sort((a, b) => b.s - a.s).forEach(({ e }, rank) => {
-      out.push({ id: `subsync-${subKey(e)}`, lang, url: subUrl(job, subKey(e)), label: labelFor(job, e, rank) });
+    list.map((e, i) => ({ e, s: rankScore(job, e, i) })).sort((a, b) => b.s - a.s).forEach(({ e }) => {
+      out.push({ id: `subsync-${subKey(e)}`, lang, url: subUrl(job, subKey(e)), label: labelFor(job, e) });
     });
-    // Action entries for clients without the web UI; never first in their language, so the player's
-    // automatic selection cannot start work on its own.
-    if (lang === MT_LANG && translate.enabled() && hasEng) {
-      out.push({ id: 'subsync-mt', lang, url: subUrl(job, 'mt'), label: mtLabel });
-      out.push({ id: 'subsync-mt-start', lang, url: subUrl(job, 'mt-start'), label: '▶ 生成 AI 中文字幕（选中即开始，同时对齐）' });
+    if (lang === MT_LANG) {
+      // One bilingual entry per kind, never first: the best English with the best human Chinese, and the
+      // AI translation once generated.
+      if (list.length && hasEng) out.push({ id: 'subsync-bi', lang, url: subUrl(job, 'bi'), label: '🀄 中英双语（人工字幕）' });
+      if (canTranslate && job.mtInfo) {
+        out.push({ id: 'subsync-mt', lang, url: subUrl(job, 'mt'), label: '🤖 AI 中文字幕' });
+        out.push({ id: 'subsync-mt-bi', lang, url: subUrl(job, 'mt', 'bi=1'), label: '🤖 中英双语（AI 字幕）' });
+      }
     }
-    if (ENG.has(lang)) out.push({ id: 'subsync-align', lang, url: subUrl(job, 'align'), label: '▶ 对齐全部字幕（选中即开始）' });
+    // Action entries for clients without the web UI. They sit at the end of the English list: never
+    // first in a language, so the player's automatic selection cannot start work on its own.
+    if (ENG.has(lang)) {
+      out.push({ id: 'subsync-align', lang, url: subUrl(job, 'align'), label: '▶ 对齐全部字幕（选中即开始）' });
+      if (canTranslate && !job.mtInfo) out.push({ id: 'subsync-mt-start', lang, url: subUrl(job, 'mt-start'), label: '▶ 生成 AI 中文字幕（选中即开始，同时对齐）' });
+    }
   }
   return out;
 }
@@ -600,13 +649,15 @@ async function handleSub(res, shortKey, key, query) {
     }
     return res.end(await renderTranslated(job, bi));
   }
-  const entry = (job.entries || []).find((e) => subKey(e) === key);
-  if (!entry) return send(res, 404, 'unknown subtitle');
+  // "bi": the top English subtitle with the top human Chinese one underneath (each language's best after
+  // alignment, its first-ranked entry before). `?bi=1` on a Chinese entry pairs that one instead.
+  const entry = key === 'bi' ? bestEntry(job, CHI) : (job.entries || []).find((e) => subKey(e) === key);
+  if (!entry) return send(res, 404, key === 'bi' ? 'no chinese subtitle' : 'unknown subtitle');
   beginText(res);
   let cues = await loadCues(job, entry);
-  if (bi && CHI.has(entry.lang)) {
+  if ((bi || key === 'bi') && CHI.has(entry.lang)) {
     const en = bestEntry(job, ENG);
-    if (en) cues = mergeBilingual(cues, await loadCues(job, en), { otherFirst: false });
+    if (en) cues = mergeBilingual(await loadCues(job, en), cues, { otherFirst: false });
   }
   res.end(formatSrt(cues.sort((a, b) => a.start - b.start)));
 }
@@ -622,8 +673,11 @@ function statusOf(job) {
       lang: CHI.has(e.lang) ? MT_LANG : 'eng',
       status: r ? r.status : 'none',
       score: r && r.status === 'done' ? Math.round(r.score * 100) / 100 : null,
+      sync: r && r.status === 'done' && typeof r.rscore === 'number' ? Math.round(r.rscore * 100) / 100 : null,
       good: Boolean(r && r.status === 'done' && isGood(r)),
-      label: labelFor(job, e, null),
+      title: titleOf(e),
+      warn: warningOf(job, e),
+      label: labelFor(job, e),
     };
   }
   const bestEn = bestEntry(job, ENG, { alignedOnly: true }), bestZh = bestEntry(job, CHI, { alignedOnly: true });

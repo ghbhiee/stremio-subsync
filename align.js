@@ -39,10 +39,18 @@ function fitToCues(refStarts, subStarts) {
       if (score > best.score + 1e-9) best = { scale, offset: off, score };
     }
   }
-  for (let off = best.offset - 0.3; off <= best.offset + 0.3; off += 0.02) {
-    const score = cueMatch(refStarts, subStarts, best.scale, off, 0.3);
-    if (score > best.fine || best.fine === undefined) { best.fine = score; best.fineOffset = off; }
+  // Fine search. Exact timings give a plateau of equally good offsets (anything within the tolerance):
+  // take its middle, not its first edge, or the result is biased by up to the tolerance.
+  const fine = [];
+  for (let off = best.offset - 0.5; off <= best.offset + 0.5; off += 0.02) fine.push([off, cueMatch(refStarts, subStarts, best.scale, off, 0.3)]);
+  best.fine = Math.max(...fine.map((f) => f[1]));
+  const top = fine.filter((f) => f[1] >= best.fine - 1e-9).map((f) => f[0]);
+  let run = [top[0]], longest = run; // longest contiguous run of best offsets
+  for (let i = 1; i < top.length; i++) {
+    if (top[i] - top[i - 1] < 0.03) run.push(top[i]); else run = [top[i]];
+    if (run.length > longest.length) longest = run;
   }
+  best.fineOffset = longest[Math.floor(longest.length / 2)];
   best.offset = best.fineOffset;
   best.score = cueMatch(refStarts, subStarts, best.scale, best.offset, 0.4);
   delete best.fine; delete best.fineOffset;
@@ -211,7 +219,16 @@ function align(cues, ref) {
   const score = ref.cues
     ? cueMatch(ref.cues.map((c) => c[0]), aligned.map((c) => c[0]), 1, 0, 0.4)
     : speechScore(ref.speech, aligned, 1, 0, 0, ref.windowEnd);
-  return { scale: fit.scale, offset: fit.offset, score, origScore, pieces: pieces.map((p) => ({ from: p.from, to: p.to, offset: p.offset })), aligned };
+  // `score` asks "does every reference cue have a counterpart?", which punishes a subtitle that merges
+  // lines (most translations do) although it is perfectly in sync. `rscore` asks the reverse: what share
+  // of this subtitle's own cues, inside the reference window, start where a reference cue starts.
+  let rscore;
+  if (ref.cues) {
+    const refStarts = ref.cues.map((c) => c[0]).sort((a, b) => a - b);
+    const mine = aligned.map((c) => c[0]).filter((t) => t >= refStarts[0] - 1 && t <= ref.windowEnd);
+    rscore = mine.length >= 5 ? cueMatch(mine, refStarts, 1, 0, 0.4) : 0;
+  }
+  return { scale: fit.scale, offset: fit.offset, score, rscore, origScore, pieces: pieces.map((p) => ({ from: p.from, to: p.to, offset: p.offset })), aligned };
 }
 
 // ---------- SRT helpers ----------
@@ -235,4 +252,4 @@ function formatSrt(blocks) {
   return blocks.map((b, i) => `${i + 1}\n${ts(b.start)} --> ${ts(b.end)}\n${b.text}\n`).join('\n');
 }
 
-module.exports = { align, speechFromRms, parseSrt, formatSrt, SCALES, BIN };
+module.exports = { align, cueMatch, speechFromRms, parseSrt, formatSrt, SCALES, BIN };

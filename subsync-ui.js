@@ -25,7 +25,7 @@
     shortKey: null, status: null, statusAt: 0, pollTimer: null,
     live: {}, liveN: 0, alignEpoch: 0, mtEpoch: 0, mtPartial: false, mtPromptShown: false,
     pausedByHover: false, hovering: false, hoverTimer: null, popup: null, popupWord: null,
-    menuObserver: null, videoObserver: null, bar: null, barKey: '', wantMt: false,
+    menuObserver: null, videoObserver: null, bar: null, barKey: '', wantMt: false, wantBi: false, biApplied: false, internalSelect: false,
     embeddedId: null, embTrack: null, embEl: null,
     embStyle: { size: 100, offset: 0, offsetMin: 0, color: 'rgb(255, 255, 255)', bg: 'rgba(0, 0, 0, 0)', outline: 'rgb(34, 34, 34)' },
   };
@@ -160,7 +160,7 @@
     watchTextTracks();
     if (!st.menuObserver) {
       st.menuObserver = new MutationObserver(scheduleMenu);
-      st.menuObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+      st.menuObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'], characterData: true });
     }
     return true;
   }
@@ -179,7 +179,7 @@
   function resetVideo() {
     stopPolling();
     st.shortKey = null; st.status = null; st.statusAt = 0; st.live = {}; st.selSig = null;
-    st.alignEpoch = 0; st.mtEpoch = 0; st.mtPartial = false; st.mtPromptShown = false; st.wantMt = false;
+    st.alignEpoch = 0; st.mtEpoch = 0; st.mtPartial = false; st.mtPromptShown = false; st.wantMt = false; st.wantBi = false; st.biApplied = false;
     st.preview = []; st.pausedByHover = false; st.barKey = '';
     closePopup();
   }
@@ -244,7 +244,7 @@
       if (st.wantMt && translateReady(s)) { // the user asked for the AI subtitle while watching something else: switch to it
         st.wantMt = false;
         var cur = parseTrack(selectedTrack());
-        if (!(cur && cur.key === 'mt' && cur.shortKey === st.shortKey)) addLive('mt', pref(LS_BI, false), 'chi');
+        if (!(cur && cur.key === 'mt' && cur.shortKey === st.shortKey && Boolean(cur.bi) === st.wantBi)) addLive('mt', st.wantBi, 'chi');
       }
     }
     renderBar();
@@ -254,15 +254,14 @@
   function onAlignFinished(s) {
     var a = s.align;
     if (a.state === 'done') {
-      var bestKey = s.best.en, label = bestKey && s.subs[bestKey] ? s.subs[bestKey].label : null;
-      toast('字幕已对齐 ✅' + (label ? ' · 最佳：' + label : ' · 没有和视频匹配的英文字幕'), 'success');
+      toast(s.best.en ? '字幕已对齐 ✅' : '对齐完成，但没有和视频匹配的英文字幕', s.best.en ? 'success' : 'error');
       // The subtitle being watched turned out not to match the video while another one does: switch.
       var t = selectedTrack(), p = parseTrack(t);
-      if (p && p.shortKey === st.shortKey && p.key !== 'mt' && p.key !== 'align' && p.key !== 'mt-start') {
+      if (p && p.shortKey === st.shortKey && p.key !== 'mt' && p.key !== 'bi' && p.key !== 'align' && p.key !== 'mt-start') {
         var info = s.subs[p.key], best = p.isZh ? s.best.zh : s.best.en;
         if (info && !info.good && best && best !== p.key) {
-          addLive(best, p.isZh && pref(LS_BI, false), p.lang);
-          toast('当前字幕与视频不匹配，已切换到最佳字幕：' + (s.subs[best] ? s.subs[best].label : best), 'info');
+          addLive(best, false, p.lang);
+          toast('当前字幕与视频不匹配，已切换到最佳字幕：' + (s.subs[best] ? s.subs[best].title : best), 'info');
         }
       }
     } else if (a.state === 'noref') toast('无法对齐：视频没有内嵌字幕轨，候选字幕之间也不一致；时间轴保持原样', 'error', 9000);
@@ -272,6 +271,32 @@
 
   // ---------- keeping the displayed subtitle current ----------
 
+  function okStatus() { return st.status && !st.status.missing ? st.status : null; }
+  function isBilingual(p) { return Boolean(p && (p.key === 'bi' || p.bi)); }
+  // What a track shows, whichever copy of it this is (the listed entry or a reloaded one).
+  function identity(p) { return p.key + (p.bi ? '+bi' : ''); }
+  function mine(t) { var p = parseTrack(t); return p && p.shortKey === st.shortKey ? p : null; }
+  function newestTrack(idn) { // the latest copy of an entry: a reloaded one if any, else the listed one
+    var best = null, bestN = -1;
+    st.tracks.forEach(function (t) {
+      var p = mine(t);
+      if (!p || identity(p) !== idn) return;
+      var n = st.live[t.id] ? st.live[t.id].n : 0;
+      if (n > bestN) { bestN = n; best = t; }
+    });
+    return best;
+  }
+  function humanChinese() {
+    var out = [];
+    st.tracks.forEach(function (t) { var p = mine(t); if (p && !p.live && p.isZh && !p.bi && p.key !== 'mt' && p.key !== 'bi' && p.key !== 'mt-start') out.push({ t: t, p: p }); });
+    return out;
+  }
+  function select(id) { // a selection made by this script, not by the viewer
+    st.internalSelect = true;
+    safeDispatch({ type: 'setProp', propName: 'selectedExtraSubtitlesTrackId', propValue: id });
+    st.internalSelect = false;
+  }
+
   function onTracks() {
     var sk = null;
     for (var i = 0; i < st.tracks.length && !sk; i++) { var p = parseTrack(st.tracks[i]); if (p && !p.live) sk = p.shortKey; }
@@ -280,80 +305,128 @@
       st.shortKey = sk;
       fetchStatus().then(function (s) { if (busy(s)) startPolling(); });
     }
+    scheduleMenu();
     syncDisplay();
   }
 
   function onSelection() {
-    var t = selectedTrack(), p = parseTrack(t);
-    if (p && !p.live) st.selSig = sigFor(p.key, p.bi);
+    var byUser = !st.internalSelect;
+    var t = selectedTrack(), p = mine(t);
+    if (p) {
+      if (!p.live) st.selSig = sigFor(p);
+      if (p.isZh) {
+        if (!st.biApplied) { // first Chinese track of this video: apply the remembered preference once
+          st.biApplied = true;
+          if (pref(LS_BI, false) && !isBilingual(p)) setTimeout(function () { bilingualOn(false); }, 0);
+        } else if (byUser) setPref(LS_BI, isBilingual(p)); // picking an entry by hand sets the preference
+      }
+      if (isBilingual(p)) ensureAligned(); // bilingual pairs two subtitles: it needs aligned timings
+    }
     renderBar();
+    scheduleMenu();
     syncDisplay();
   }
 
-  function sigFor(key, bi) { return key + '|' + (bi ? 1 : 0) + '|' + st.alignEpoch + '|' + (key === 'mt' ? st.mtEpoch : 0); }
+  function ensureAligned() {
+    var s = okStatus();
+    if (s && s.align.state !== 'done' && !s.align.running) postAction({ align: true });
+  }
+
+  // Bilingual is one of two tracks: the best English with the best human Chinese ("bi"), or, when the
+  // film has no human Chinese subtitle, the AI translation ("mt" with bi=1), generated on request.
+  function bilingualOn(byUser) {
+    var s = okStatus(), t;
+    if (humanChinese().length) {
+      t = newestTrack('bi');
+      if (t) select(t.id); else addLive('bi', false, 'chi');
+      ensureAligned();
+      return;
+    }
+    if (translateReady(s)) {
+      t = newestTrack('mt+bi');
+      if (t) select(t.id); else addLive('mt', true, 'chi');
+      ensureAligned();
+      return;
+    }
+    if (!s || !s.translate.enabled || !s.hasEng) { if (byUser) toast('这部片没有中文字幕，也没有可翻译的英文字幕', 'error'); return; }
+    if (!byUser) { if (!st.mtPromptShown) promptGenerate(); return; }
+    st.wantMt = true; st.wantBi = true;
+    var ts = s.translate.state;
+    if (ts !== 'running' && ts !== 'waiting-align') postAction({ bilingual: true });
+    toast('正在生成 AI 中文字幕并对齐，完成后自动切换为中英双语', 'info', 8000);
+  }
+
+  function bilingualOff() {
+    var p = mine(selectedTrack()), s = okStatus(), t = null;
+    st.wantBi = false;
+    if (!isBilingual(p)) return;
+    if (p.key === 'mt') {
+      t = newestTrack('mt');
+      if (t) select(t.id); else addLive('mt', false, 'chi');
+      return;
+    }
+    var human = humanChinese();
+    if (s && s.best.zh) human.forEach(function (h) { if (!t && h.p.key === s.best.zh) t = newestTrack(h.p.key) || h.t; });
+    if (!t && human.length) t = newestTrack(human[0].p.key) || human[0].t;
+    if (t) select(t.id);
+  }
+
+  function sigFor(p) { return identity(p) + '|' + st.alignEpoch + '|' + (p.key === 'mt' ? st.mtEpoch : 0); }
 
   function translateReady(s) {
     return Boolean(s && !s.missing && s.translate.enabled && (s.translate.state === 'done' || (s.translate.state === 'running' && st.mtPartial)));
   }
 
-  // Compare what is shown with what should be shown; load a fresh copy from the addon when they differ.
+  // The player fetches a subtitle once. When alignment or translation has moved on since the track on
+  // screen was loaded, load a fresh copy of the same entry (the older copy is then hidden in the menu).
   var syncTimer = null;
   function syncDisplay() {
     if (syncTimer) return;
     syncTimer = setTimeout(function () { syncTimer = null; syncNow(); }, 50);
   }
   function syncNow() {
-    var t = selectedTrack(), p = parseTrack(t), s = st.status;
-    if (!p || p.shortKey !== st.shortKey || p.key === 'align' || p.key === 'mt-start') return;
-    var wantBi = p.isZh && pref(LS_BI, false);
-    var current = p.live ? st.live[t.id].sig : st.selSig;
-    var desired = sigFor(p.key, wantBi);
+    var t = selectedTrack(), p = mine(t), s = okStatus();
+    if (!p || p.key === 'align' || p.key === 'mt-start') return;
+    var current = p.live ? st.live[t.id].sig : st.selSig, desired = sigFor(p);
     if (current === desired) return;
-    var cur = (current || '').split('|'), des = desired.split('|');
-    var useful = cur[1] !== des[1]; // bilingual on/off changed: always worth a reload
-    if (!s || s.missing) {
-      if (!useful) return;
-    } else if (p.key === 'mt') {
-      if (!translateReady(s)) { // nothing translated yet: an AI track would only show English
-        if (wantBi && !st.mtPromptShown && !st.wantMt && s.translate.enabled && s.translate.state !== 'running' && s.translate.state !== 'waiting-align') promptGenerate();
-        remember(t, p, desired);
-        return;
+    var cur = (current || '').split('|'), des = desired.split('|'), useful = false;
+    if (s) {
+      if (cur[1] !== des[1]) { // an alignment finished since this copy was loaded
+        if (p.key === 'bi') useful = s.align.state === 'done';
+        else if (p.key === 'mt') useful = Boolean(s.translate.source && s.subs[s.translate.source] && s.subs[s.translate.source].status === 'done');
+        else useful = Boolean(s.subs[p.key] && s.subs[p.key].status === 'done');
       }
-      useful = useful || cur[2] !== des[2] || cur[3] !== des[3];
-    } else {
-      var aligned = s.subs[p.key] && s.subs[p.key].status === 'done';
-      var enAligned = s.best.en && s.subs[s.best.en] && s.subs[s.best.en].status === 'done';
-      if (cur[2] !== des[2] && (aligned || (wantBi && enAligned))) useful = true;
+      if (p.key === 'mt' && cur[2] !== des[2] && translateReady(s)) useful = true;
     }
-    if (!useful) { remember(t, p, desired); return; }
-    addLive(p.key, wantBi, p.lang);
+    if (!useful) { if (p.live) st.live[t.id].sig = desired; else st.selSig = desired; return; }
+    addLive(p.key, p.bi, t.lang);
   }
-  function remember(t, p, sig) { if (p.live) st.live[t.id].sig = sig; else st.selSig = sig; }
 
-  function labelFor(key, bi) {
-    var s = st.status && !st.status.missing ? st.status : null;
-    if (key === 'mt') {
-      var done = s && s.translate.state === 'done';
-      return (bi ? '🤖 中英双语（AI 翻译）' : '🤖 AI 中文字幕') + (done ? ' ✅' : ' · 生成中');
-    }
-    var base = s && s.subs[key] && s.subs[key].label ? s.subs[key].label : key;
-    return (bi ? '🀄 中英双语 · ' : '') + base;
+  // Name and second line of an entry: the second line carries a warning only when alignment found one.
+  function describe(p) {
+    var s = okStatus();
+    if (p.key === 'bi') return { title: '🀄 中英双语（人工字幕）', note: '' };
+    if (p.key === 'mt') return { title: p.bi ? '🤖 中英双语（AI 字幕）' : '🤖 AI 中文字幕', note: s && (s.translate.state === 'running' || s.translate.state === 'waiting-align') ? '生成中，后面的句子稍后补上' : '' };
+    var info = s && s.subs[p.key];
+    if (!info) return null;
+    return { title: (p.bi ? '🀄 中英双语 · ' : '') + info.title, note: info.warn || '' };
   }
 
   function addLive(key, bi, lang) {
     if (!st.shortKey || !st.video) return;
-    var id = 'subsync-live-' + (++st.liveN);
-    var sig = sigFor(key, bi);
-    var url = BASE + '/sub/' + st.shortKey + '/' + key + '.srt?' + (bi ? 'bi=1&' : '') + 'r=' + st.liveN;
-    st.live[id] = { key: key, bi: bi, sig: sig };
-    var track = { id: id, lang: lang || (key === 'mt' ? 'chi' : 'eng'), label: labelFor(key, bi), url: url, origin: ORIGIN, embedded: false };
+    var n = ++st.liveN, id = 'subsync-live-' + n;
+    var p = { key: key, bi: Boolean(bi) };
+    var url = BASE + '/sub/' + st.shortKey + '/' + key + '.srt?' + (bi ? 'bi=1&' : '') + 'r=' + n;
+    var d = describe(p) || { title: key, note: '' };
+    st.live[id] = { key: key, bi: Boolean(bi), sig: sigFor(p), n: n };
+    var track = { id: id, lang: lang || (key === 'mt' || key === 'bi' ? 'chi' : 'eng'), label: d.title, url: url, origin: d.note || ORIGIN, embedded: false };
     if (!safeDispatch({ type: 'command', commandName: 'addExtraSubtitlesTracks', commandArgs: { tracks: [track] } })) return;
-    safeDispatch({ type: 'setProp', propName: 'selectedExtraSubtitlesTrackId', propValue: id });
+    select(id);
   }
 
   function promptGenerate() {
     st.mtPromptShown = true;
-    toast('还没有 AI 中文字幕。生成后自动切换为中英双语（同时对齐字幕）', 'info', 15000, { label: '生成', onClick: function () { postAction({ bilingual: true }); } });
+    toast('这部片没有中文字幕。生成 AI 中文字幕后自动切换为中英双语（同时对齐）', 'info', 15000, { label: '生成', onClick: function () { st.wantMt = true; st.wantBi = true; postAction({ bilingual: true }); } });
   }
 
   // ---------- notifications ----------
@@ -390,7 +463,7 @@
     badgeTimer = setTimeout(function () { b.classList.remove('show'); }, 900);
   }
 
-  // ---------- subtitles menu: language order, hidden action entries, and the bar attached above it ----------
+  // ---------- subtitles menu: language order, tidy entries, and the bar attached above it ----------
 
   var menuScheduled = false;
   function scheduleMenu() { // setTimeout, not requestAnimationFrame: the latter stops in a background tab
@@ -410,6 +483,47 @@
     if (st.bar && st.bar.parentNode) st.bar.parentNode.removeChild(st.bar);
     st.barKey = '';
   }
+  function trackOfRow(row) { // the track a menu row stands for, from the row component's props
+    var f = fiberOf(row), hops = 0;
+    while (f && hops++ < 8) {
+      if (f.memoizedProps && f.memoizedProps.track && typeof f.memoizedProps.track.id === 'string') return f.memoizedProps.track;
+      f = f.return;
+    }
+    return null;
+  }
+  function setText(node, text) { // change React's own text node in place, so later updates by React still land
+    if (!node) return;
+    var tn = node.firstChild;
+    if (tn && tn.nodeType === 3) { if (tn.nodeValue !== text) tn.nodeValue = text; } else if (node.textContent !== text) node.textContent = text;
+  }
+
+  // Each entry appears once: its newest copy. Older copies (the player cannot remove a track) and the "▶"
+  // entries meant for clients without this script are hidden. The first line names the entry; a warning
+  // from alignment goes on the second line, where the addon name normally is.
+  function tidyRows(list) {
+    var rows = [], newest = {}, i;
+    for (i = 0; i < list.children.length; i++) {
+      var row = list.children[i], track = trackOfRow(row), p = track ? mine(track) : null;
+      var n = track && st.live[track.id] ? st.live[track.id].n : 0;
+      rows.push({ row: row, track: track, p: p, n: n });
+      if (p && p.key !== 'align' && p.key !== 'mt-start') { var idn = identity(p); if (!(idn in newest) || n > newest[idn]) newest[idn] = n; }
+    }
+    rows.forEach(function (r) {
+      var hide = false;
+      if (r.p) {
+        if (r.p.key === 'align' || r.p.key === 'mt-start') hide = true;
+        else if (r.n < newest[identity(r.p)] && r.track.id !== st.selectedId) hide = true;
+      } else if (/^\s*▶/.test(r.row.textContent || '')) hide = true;
+      var display = hide ? 'none' : '';
+      if (r.row.style.display !== display) r.row.style.display = display;
+      if (hide || !r.track) return;
+      var info = r.row.firstElementChild, label = info && info.children[0], origin = info && info.children[1];
+      var d = r.p ? describe(r.p) : null;
+      if (d) { setText(label, d.title); setText(origin, d.note || ORIGIN); }
+      else if (origin && /^(⚠️|✗|生成中)/.test(origin.textContent || '')) setText(origin, String(r.track.origin || '')); // a reused row still carrying our note
+    });
+  }
+
   function renderMenu() {
     var m = findMenu();
     if (!m) { removeBar(); return; }
@@ -421,14 +535,8 @@
       if (c.style.order !== String(order)) c.style.order = String(order);
       if (c.style.flexShrink !== '0') c.style.flexShrink = '0';
     }
-    // The "▶" entries exist for clients without this UI; here the buttons of the bar replace them.
     var vl = m.variants.children[m.variants.children.length - 1];
-    if (vl) {
-      for (var j = 0; j < vl.children.length; j++) {
-        var opt = vl.children[j];
-        if (/^\s*▶/.test(opt.textContent || '') && opt.style.display !== 'none') opt.style.display = 'none';
-      }
-    }
+    if (vl && vl.children.length && vl.children[0].firstElementChild) tidyRows(vl);
     // The bar hangs above the menu, outside it, so the menu's own columns keep their room.
     if (!st.bar) {
       st.bar = el('div', 'ss-bar');
@@ -445,101 +553,55 @@
     renderBar();
   }
 
-  function alignText(s) {
-    var a = s.align;
-    if (a.running || a.state === 'running') {
-      if (a.phase === 'video') return '查找视频…';
-      if (a.phase === 'reference') return '读取片头（需下载前 10 分钟）…';
-      if (a.phase === 'consensus') return '比对候选字幕…';
-      return '对齐中 ' + a.done + '/' + a.total;
-    }
-    if (a.state === 'done') {
-      var b = s.best.en && s.subs[s.best.en];
-      return '✅ 已对齐' + (b ? '（最佳 ' + Math.round((b.score || 0) * 100) + '%）' : '（没有匹配的英文字幕）');
-    }
-    if (a.state === 'noref') return '无法对齐（无内嵌字幕，候选也不一致）';
-    if (a.state === 'novideo') return '无法对齐（引擎里没有该视频）';
-    if (a.state === 'failed') return '失败：' + (a.error || '');
-    return '未对齐';
-  }
-  function translateText(s) {
-    var t = s.translate;
-    if (t.state === 'waiting-align') return '等待对齐后开始…';
-    if (t.state === 'running') return '生成中 ' + t.done + '/' + t.total + (t.coveredUntil !== null ? '（已到 ' + fmtTime(t.coveredUntil) + '）' : '');
-    if (t.state === 'done') return '✅ 已生成' + (t.stale ? '（源字幕不匹配）' : '');
-    if (t.state === 'failed') return '失败：' + (t.error || '');
-    return '未生成';
-  }
-
-  // Our Chinese track to show when bilingual is switched on while something else (an embedded track,
-  // English, another addon) is selected: the best aligned human subtitle, else a human one alignment has
-  // not rejected, else the AI track.
-  function pickChinese(s) {
-    var human = [], mt = null;
-    st.tracks.forEach(function (t) {
-      var p = parseTrack(t);
-      if (!p || p.live || !p.isZh || p.shortKey !== st.shortKey || p.key === 'mt-start') return;
-      if (p.key === 'mt') mt = t; else human.push({ t: t, p: p });
-    });
-    var i;
-    if (s && s.best.zh) for (i = 0; i < human.length; i++) if (human[i].p.key === s.best.zh) return human[i].t;
-    for (i = 0; i < human.length; i++) {
-      var info = s && s.subs[human[i].p.key];
-      if (!(info && info.status === 'done' && !info.good)) return human[i].t;
-    }
-    return mt || (human[0] && human[0].t) || null;
-  }
-
-  function onBilingual(on) {
-    setPref(LS_BI, on);
-    var s = st.status && !st.status.missing ? st.status : null;
-    var p = parseTrack(selectedTrack());
-    if (on && !(p && p.isZh && p.shortKey === st.shortKey)) {
-      var target = pickChinese(s);
-      if (target) { safeDispatch({ type: 'setProp', propName: 'selectedExtraSubtitlesTrackId', propValue: target.id }); p = parseTrack(target); }
-    }
-    if (on && s && p) {
-      var ts = s.translate.state;
-      if (p.key === 'mt') { if (s.translate.enabled && ts !== 'done' && ts !== 'running' && ts !== 'waiting-align') { st.wantMt = true; postAction({ bilingual: true }); } }
-      else if (s.align.state !== 'done' && !s.align.running) postAction({ align: true });
-    }
-    renderBar();
-    syncDisplay();
+  function alignProgress(a) {
+    if (a.phase === 'video') return '字幕对齐：查找视频…';
+    if (a.phase === 'reference') return '字幕对齐：读取片头（需下载前 10 分钟）…';
+    if (a.phase === 'consensus') return '字幕对齐：比对候选字幕…';
+    return '字幕对齐中 ' + a.done + '/' + a.total;
   }
 
   function cell() { var c = el('div', 'ss-cell'); for (var i = 0; i < arguments.length; i++) if (arguments[i]) c.appendChild(arguments[i]); return c; }
   function button(label, onClick) { var b = el('button', 'ss-btn', label); b.addEventListener('click', onClick); return b; }
 
+  // The bar says what can be done and what is in progress or went wrong; finished work is not announced.
   function renderBar() {
     var bar = st.bar;
     if (!bar || !bar.parentNode) return;
-    var s = st.status, p = parseTrack(selectedTrack());
-    var bi = pref(LS_BI, false), hover = pref(LS_HOVER, true);
+    var s = st.status, p = mine(selectedTrack());
+    var biNow = isBilingual(p), hover = pref(LS_HOVER, true);
     var key = JSON.stringify([st.shortKey, !s ? null : s.missing ? 'missing' : [s.align.state, s.align.running, s.align.phase, s.align.done, s.align.total, s.align.error,
-      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng], bi, hover, st.selectedId, st.embeddedId]);
+      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, st.selectedId, st.embeddedId, st.wantBi]);
     if (key === st.barKey) return; // nothing changed: leave the DOM alone (the menu observer would loop otherwise)
     st.barKey = key;
     bar.textContent = '';
     if (st.shortKey) {
-      var sw = el('div', 'ss-sw' + (bi ? ' on' : ''));
-      sw.addEventListener('click', function () { onBilingual(!pref(LS_BI, false)); });
+      var sw = el('div', 'ss-sw' + (biNow || st.wantBi ? ' on' : ''));
+      sw.addEventListener('click', function () {
+        var on = !(isBilingual(mine(selectedTrack())) || st.wantBi);
+        setPref(LS_BI, on);
+        if (on) bilingualOn(true); else bilingualOff();
+        renderBar();
+      });
       bar.appendChild(cell(sw, el('span', 'ss-title', '中英双语')));
-      if (!s) bar.appendChild(cell(el('span', 'ss-muted', '读取状态…')));
-      else if (s.missing) bar.appendChild(cell(el('span', 'ss-muted', '服务已重启，请重新打开视频')));
-      else {
+      if (s && s.missing) bar.appendChild(cell(el('span', 'ss-muted', '服务已重启，请重新打开视频')));
+      else if (s) {
+        var ts = s.translate.state, a = s.align;
         if (s.translate.enabled && s.hasEng) {
-          var tb = null, ts = s.translate.state;
-          if (ts === 'idle' || ts === 'failed') tb = button(ts === 'failed' ? '重试' : '生成', function () { st.wantMt = true; postAction({ translate: true }); });
-          else if (ts === 'done' && s.translate.stale) tb = button('用最佳英文重新生成', function () { st.wantMt = true; postAction({ translate: true, force: true }); });
-          bar.appendChild(cell(el('span', null, 'AI 中文字幕：' + translateText(s)), tb));
+          if (ts === 'idle') bar.appendChild(cell(button('生成 AI 中文字幕', function () { st.wantMt = true; st.wantBi = false; postAction({ translate: true }); })));
+          else if (ts === 'waiting-align') bar.appendChild(cell(el('span', null, 'AI 中文字幕：等待对齐后开始…')));
+          else if (ts === 'running') bar.appendChild(cell(el('span', null, 'AI 中文字幕生成中 ' + s.translate.done + '/' + s.translate.total)));
+          else if (ts === 'failed') bar.appendChild(cell(el('span', null, 'AI 中文字幕失败：' + (s.translate.error || '')), button('重试', function () { st.wantMt = true; postAction({ translate: true }); })));
+          else if (ts === 'done' && s.translate.stale) bar.appendChild(cell(el('span', null, 'AI 字幕的源字幕与视频不匹配'), button('用最佳英文重新生成', function () { st.wantMt = true; st.wantBi = isBilingual(mine(selectedTrack())); postAction({ translate: true, force: true }); })));
         }
-        var ab = null;
-        if (!s.align.running && s.align.state !== 'done') ab = button(s.align.state === 'idle' ? '开始对齐' : '重试', function () { postAction({ align: true }); });
-        else if (s.align.state === 'done' && p && p.shortKey === st.shortKey && p.key !== 'mt') {
+        if (a.running || a.state === 'running') bar.appendChild(cell(el('span', null, alignProgress(a))));
+        else if (a.state === 'idle') bar.appendChild(cell(button('开始对齐', function () { postAction({ align: true }); })));
+        else if (a.state === 'noref') bar.appendChild(cell(el('span', null, '无法对齐：视频无内嵌字幕，候选字幕也不一致'), button('重试', function () { postAction({ align: true }); })));
+        else if (a.state === 'novideo') bar.appendChild(cell(el('span', null, '无法对齐：引擎里没有该视频'), button('重试', function () { postAction({ align: true }); })));
+        else if (a.state === 'failed') bar.appendChild(cell(el('span', null, '对齐失败：' + (a.error || '')), button('重试', function () { postAction({ align: true }); })));
+        else if (a.state === 'done' && p && p.key !== 'mt' && p.key !== 'bi' && s.subs[p.key] && !s.subs[p.key].good) {
           var best = p.isZh ? s.best.zh : s.best.en;
-          if (best && best !== p.key) ab = button('切换到最佳', function () { addLive(best, p.isZh && pref(LS_BI, false), p.isZh ? 'chi' : 'eng'); });
+          if (best && best !== p.key) bar.appendChild(cell(el('span', null, '当前字幕与视频不匹配'), button('切换到最佳', function () { addLive(best, false, p.isZh ? 'chi' : 'eng'); })));
         }
-        bar.appendChild(cell(el('span', null, '字幕对齐：' + alignText(s)), ab));
       }
     }
     var chk = el('label', 'ss-chk');
