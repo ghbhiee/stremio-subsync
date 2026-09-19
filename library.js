@@ -34,6 +34,7 @@ const METADATA_MS = 600000;   // how long to wait for the torrent's file list
 const SAVE_EVERY_MS = 10000;
 const ARIA_ATTEMPTS = 3;      // failed aria2 runs before the engine takes over
 const ARIA_STALL_S = 600;     // aria2 gives up after this long without a byte (--bt-stop-timeout)
+const ENGINE_HAS_IT = 0.9;    // the engine already holds this share of the file: copy it from there, skip aria2
 
 let cfg = null;
 const items = new Map();   // id -> item (what item.json holds)
@@ -259,6 +260,19 @@ async function cleanupAria(it) {
   await fsp.rm(torrentPath(it), { force: true }).catch(() => {});
 }
 
+// Someone who has just watched a film has most of it in the engine's cache: reading it from there takes
+// seconds, while aria2 would fetch the whole file from the swarm again. Only an active torrent counts (the
+// list request does not make the engine load anything).
+async function engineAlreadyHas(it) {
+  if (it.fileIdx === null) return false;
+  try {
+    const all = await engineJson('/stats.json', { timeout: 4000 });
+    if (!all || !all[it.infoHash]) return false;
+    const stats = await engineJson(`/${it.infoHash}/${it.fileIdx}/stats.json`, { timeout: 4000 });
+    return Number(stats && stats.streamProgress) >= ENGINE_HAS_IT;
+  } catch (_) { return false; }
+}
+
 // ---------- queue ----------
 
 async function quotaError(size, remaining, exceptId) { // quota counts whole files; the disk only has to take what is still missing
@@ -319,6 +333,10 @@ async function run(it) {
     it.state = 'downloading'; it.error = ''; it.startedAt = it.startedAt || new Date().toISOString();
     await save(it);
     let fetched = false;
+    if (cfg.downloader !== 'engine' && it.downloader !== 'aria2' && it.downloader !== 'engine' && await engineAlreadyHas(it)) {
+      cfg.log('library: the engine already has this file, copying from its cache', it.name || it.infoHash);
+      it.downloader = 'engine';
+    }
     if (cfg.downloader !== 'engine' && it.downloader !== 'engine' && !ariaMissing) {
       it.downloader = 'aria2';
       const progress = setInterval(() => { if (Date.now() - lastSave > SAVE_EVERY_MS && it.name) { lastSave = Date.now(); save(it).catch(() => {}); } }, 2000);
