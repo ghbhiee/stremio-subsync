@@ -898,5 +898,7 @@ http.createServer(async (req, res) => {
 library.init({
   dir: LIBRARY_DIR, engine: ENGINE, log, ffprobe: FFPROBE, maxBytes: LIBRARY_MAX_BYTES, minFree: LIBRARY_MIN_FREE,
   concurrency: Number(process.env.LIBRARY_CONCURRENCY || 1), publicBase: LIBRARY_PUBLIC_BASE, fallbackBase: `${PUBLIC_BASE}/${TOKEN}/lib`,
+  aria2: process.env.ARIA2_BIN || 'aria2c', downloader: process.env.LIBRARY_DOWNLOADER || 'auto', // aria2 when installed, else the engine
+  ariaRetryMs: Number(process.env.LIBRARY_ARIA_RETRY_MS || 5000),
   trackers: (process.env.LIBRARY_TRACKERS || '').split(',').map((t) => t.trim()).filter(Boolean),
 }).catch((e) => log('library init failed', e.message));

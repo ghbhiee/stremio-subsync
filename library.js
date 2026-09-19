@@ -5,6 +5,10 @@
 // meanwhile shares those pieces, which is what makes "watch while it downloads" work without any code of
 // our own. Each item lives in <dir>/<id>/ as item.json plus the video file ("<name>.part" until complete),
 // so a restart of the service resumes where the file ends.
+// When aria2c is installed it does the downloading instead (it connects to many more peers: on a torrent
+// the engine fetched at 0.6 MB/s from 6 peers, aria2 reached 3.7 MiB/s from 75), and the engine is the
+// fallback when aria2 is missing, keeps failing or stalls. Watching while aria2 downloads still goes
+// through the engine, which then fetches its own copy of what is being watched.
 'use strict';
 
 const fs = require('fs');
@@ -14,7 +18,7 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { pipeline } = require('stream');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
 // Public trackers added to the ones the stream came with: more peers for poorly seeded torrents.
 const DEFAULT_TRACKERS = [
@@ -28,11 +32,15 @@ const MIME = { mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', mkv: 
 const STALL_MS = 180000;      // no byte for this long: drop the request and ask the engine again
 const METADATA_MS = 600000;   // how long to wait for the torrent's file list
 const SAVE_EVERY_MS = 10000;
+const ARIA_ATTEMPTS = 3;      // failed aria2 runs before the engine takes over
+const ARIA_STALL_S = 600;     // aria2 gives up after this long without a byte (--bt-stop-timeout)
 
 let cfg = null;
 const items = new Map();   // id -> item (what item.json holds)
 const active = new Map();  // id -> { cancel(), samples: [[ms, bytes]], lastData, note }
 let engineStatsCache = { at: 0, data: {} };
+let ariaMissing = false;   // aria2c could not be started: do not try again until the service restarts
+const children = new Set();
 
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -152,6 +160,105 @@ async function oshash(file, size) {
   } finally { await fh.close(); }
 }
 
+// ---------- aria2 ----------
+
+// Just enough bencode to read the file list of a .torrent: strings stay Buffers (piece hashes are binary).
+function bdecode(buf) {
+  let pos = 0;
+  function next() {
+    const c = buf[pos];
+    if (c === 0x69) { const end = buf.indexOf(0x65, pos); const n = Number(buf.toString('latin1', pos + 1, end)); pos = end + 1; return n; } // i...e
+    if (c === 0x6c) { pos++; const list = []; while (buf[pos] !== 0x65) list.push(next()); pos++; return list; } // l...e
+    if (c === 0x64) { pos++; const dict = {}; while (buf[pos] !== 0x65) { const k = next().toString('utf8'); dict[k] = next(); } pos++; return dict; } // d...e
+    const colon = buf.indexOf(0x3a, pos), len = Number(buf.toString('latin1', pos, colon));
+    if (colon < 0 || !Number.isInteger(len) || len < 0 || colon + 1 + len > buf.length) throw new Error('bad torrent file');
+    pos = colon + 1 + len;
+    return buf.subarray(colon + 1, pos);
+  }
+  return next();
+}
+
+function torrentFiles(buf) {
+  const info = bdecode(buf).info || {};
+  const str = (b) => (Buffer.isBuffer(b) ? b.toString('utf8') : '');
+  if (Array.isArray(info.files)) return info.files.map((f) => ({ name: (f['path.utf-8'] || f.path || []).map(str).join('/'), length: Number(f.length) }));
+  return [{ name: str(info['name.utf-8'] || info.name), length: Number(info.length) }];
+}
+
+function ariaDir(it) { return path.join(itemDir(it), 'aria'); }
+function torrentPath(it) { return path.join(itemDir(it), `${it.infoHash}.torrent`); }
+
+async function walk(dir) { // regular files below dir, with the bytes actually allocated (aria2 writes sparse files)
+  const out = [];
+  for (const e of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...await walk(full));
+    else if (e.isFile() && !e.name.endsWith('.aria2')) { const s = await fsp.stat(full).catch(() => null); if (s) out.push({ file: full, size: s.size, allocated: s.blocks * 512 }); }
+  }
+  return out;
+}
+
+function runAria(args, st, onLine) { // resolves with the exit code; rejects when aria2c cannot be started
+  return new Promise((resolve, reject) => {
+    const child = spawn(cfg.aria2, ['--no-conf=true', '--enable-dht=true', `--dht-file-path=${path.join(cfg.dir, 'aria2-dht.dat')}`, '--seed-time=0', '--console-log-level=warn', ...args], { stdio: ['ignore', 'pipe', 'ignore'] });
+    children.add(child);
+    st.cancel = () => { st.canceled = true; child.kill('SIGTERM'); };
+    let tail = '';
+    child.stdout.on('data', (d) => { const lines = (tail + d).split(/\r?\n/); tail = lines.pop(); if (onLine) lines.forEach(onLine); });
+    child.on('error', (e) => { children.delete(child); reject(e); });
+    child.on('close', (code, signal) => { children.delete(child); resolve(signal ? 143 : code); });
+  });
+}
+
+// Download with aria2: metadata first (so the file can be chosen and the quota checked), then the file.
+// aria2's control file next to the data lets the same command continue after a restart.
+async function downloadWithAria(it, st) {
+  const trackers = sourcesOf(it).filter((x) => x.startsWith('tracker:')).map((x) => x.slice(8));
+  await fsp.mkdir(itemDir(it), { recursive: true, mode: 0o755 });
+  if (!(await sizeOf(torrentPath(it)))) {
+    st.note = '正在获取种子信息…';
+    const magnet = `magnet:?xt=urn:btih:${it.infoHash}${trackers.map((t) => `&tr=${encodeURIComponent(t)}`).join('')}`;
+    const code = await runAria(['--bt-metadata-only=true', '--bt-save-metadata=true', `--dir=${itemDir(it)}`, `--bt-stop-timeout=${Math.round(METADATA_MS / 1000)}`, '--summary-interval=0', magnet], st);
+    if (st.canceled) throw new Error('canceled');
+    if (code !== 0 || !(await sizeOf(torrentPath(it)))) throw new Error('aria2 拿不到种子信息');
+  }
+  const files = torrentFiles(await fsp.readFile(torrentPath(it)));
+  if (it.fileIdx === null || !files[it.fileIdx]) {
+    let best = -1;
+    files.forEach((f, i) => { if (VIDEO_EXT.test(f.name) && (best < 0 || f.length > files[best].length)) best = i; });
+    if (best < 0) throw Object.assign(new Error('种子里没有视频文件'), { fatal: true });
+    it.fileIdx = best;
+  }
+  it.name = sanitizeName(files[it.fileIdx].name);
+  it.size = files[it.fileIdx].length;
+  // The file aria2 is writing: by name, else the one holding the most data (neighbours of the selected file
+  // get a few boundary pieces). Its length reaches the full size only when the last piece is written.
+  const target = async () => (await walk(ariaDir(it))).sort((a, b) => Number(sanitizeName(b.file) === it.name) - Number(sanitizeName(a.file) === it.name) || b.allocated - a.allocated)[0] || null;
+  const have = await target();
+  const over = await quotaError(it.size, it.size - (have ? Math.min(it.size, have.allocated) : 0), it.id);
+  if (over) throw Object.assign(new Error(over), { fatal: true });
+  await save(it);
+
+  st.note = '';
+  const poll = setInterval(async () => { const f = await target(); if (f && !st.canceled) it.downloaded = Math.min(it.size, f.allocated); }, 2000);
+  try {
+    const code = await runAria([`--dir=${ariaDir(it)}`, `--select-file=${it.fileIdx + 1}`, '--file-allocation=none', '--bt-max-peers=120', '--bt-remove-unselected-file=true',
+      '--max-overall-upload-limit=100K', `--bt-stop-timeout=${ARIA_STALL_S}`, '--summary-interval=3', ...(trackers.length ? [`--bt-tracker=${trackers.join(',')}`] : []), torrentPath(it)],
+    st, (line) => { const m = /\bCN:(\d+)/.exec(line); if (m) st.peers = Number(m[1]); });
+    if (st.canceled) throw new Error('canceled');
+    if (code !== 0) throw new Error(code === 7 ? 'aria2 长时间没有数据' : `aria2 退出码 ${code}`);
+  } finally { clearInterval(poll); }
+  const f = await target();
+  if (!f || f.size !== it.size || await sizeOf(`${f.file}.aria2`)) throw new Error('aria2 结束了但文件不完整');
+  await fsp.rename(f.file, filePath(it));
+  await cleanupAria(it);
+}
+
+async function cleanupAria(it) {
+  await fsp.rm(ariaDir(it), { recursive: true, force: true }).catch(() => {});
+  await fsp.rm(torrentPath(it), { force: true }).catch(() => {});
+}
+
 // ---------- queue ----------
 
 async function quotaError(size, remaining, exceptId) { // quota counts whole files; the disk only has to take what is still missing
@@ -169,42 +276,72 @@ async function freeBytes() {
 
 function fmtSize(n) { return n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`; }
 
+async function downloadWithEngine(it, st) {
+  let lastSave = 0, fails = 0;
+  it.downloader = 'engine';
+  const info = await prepare(it, st);
+  if (it.name !== info.name) { // the name the viewer's player reported may differ from the torrent's
+    const from = it.name ? partPath(it) : null;
+    it.name = info.name;
+    if (from && await sizeOf(from)) await fsp.rename(from, partPath(it)).catch(() => {});
+  }
+  it.size = info.size;
+  const over = await quotaError(it.size, it.size - await sizeOf(partPath(it)), it.id);
+  if (over) throw Object.assign(new Error(over), { fatal: true });
+  const progress = setInterval(() => { if (Date.now() - lastSave > SAVE_EVERY_MS) { lastSave = Date.now(); save(it).catch(() => {}); } }, 2000);
+  try {
+    for (;;) {
+      let offset = await sizeOf(partPath(it));
+      if (offset > it.size) { await fsp.truncate(partPath(it), 0); offset = 0; }
+      it.downloaded = offset;
+      if (offset === it.size) break;
+      try { await pull(it, st, offset); fails = 0; } catch (e) {
+        if (st.canceled) throw e;
+        fails++;
+        st.note = `${e.message}，重试中`;
+        cfg.log('library retry', it.name, e.message);
+        await sleep(Math.min(60000, 5000 * fails));
+        if (st.canceled) throw new Error('canceled');
+        await engineJson(`/${it.infoHash}/create`, { method: 'POST', body: { torrent: { infoHash: it.infoHash }, peerSearch: { sources: sourcesOf(it), min: 40, max: 200 }, guessFileIdx: false } }).catch(() => {});
+      }
+    }
+  } finally { clearInterval(progress); }
+  await fsp.rename(partPath(it), filePath(it));
+}
+
 async function run(it) {
-  const st = { canceled: false, cancel: () => { st.canceled = true; }, lastData: Date.now(), note: '', samples: [] };
+  const st = { canceled: false, cancel: () => { st.canceled = true; }, lastData: Date.now(), note: '', samples: [], peers: null };
+  st.finished = new Promise((resolve) => { st.resolve = resolve; });
   active.set(it.id, st);
   const sampler = setInterval(() => { st.samples.push([Date.now(), it.downloaded]); if (st.samples.length > 8) st.samples.shift(); }, 2000);
-  let lastSave = 0, fails = 0;
+  let lastSave = 0;
   try {
     it.state = 'downloading'; it.error = ''; it.startedAt = it.startedAt || new Date().toISOString();
     await save(it);
-    const info = await prepare(it, st);
-    if (it.name !== info.name) { // the name the viewer's player reported may differ from the torrent's
-      const from = it.name ? partPath(it) : null;
-      it.name = info.name;
-      if (from && await sizeOf(from)) await fsp.rename(from, partPath(it)).catch(() => {});
-    }
-    it.size = info.size;
-    const over = await quotaError(it.size, it.size - await sizeOf(partPath(it)), it.id);
-    if (over) throw Object.assign(new Error(over), { fatal: true });
-    const progress = setInterval(() => { if (Date.now() - lastSave > SAVE_EVERY_MS) { lastSave = Date.now(); save(it).catch(() => {}); } }, 2000);
-    try {
-      for (;;) {
-        let offset = await sizeOf(partPath(it));
-        if (offset > it.size) { await fsp.truncate(partPath(it), 0); offset = 0; }
-        it.downloaded = offset;
-        if (offset === it.size) break;
-        try { await pull(it, st, offset); fails = 0; } catch (e) {
-          if (st.canceled) throw e;
-          fails++;
-          st.note = `${e.message}，重试中`;
-          cfg.log('library retry', it.name, e.message);
-          await sleep(Math.min(60000, 5000 * fails));
-          if (st.canceled) throw new Error('canceled');
-          await engineJson(`/${it.infoHash}/create`, { method: 'POST', body: { torrent: { infoHash: it.infoHash }, peerSearch: { sources: sourcesOf(it), min: 40, max: 200 }, guessFileIdx: false } }).catch(() => {});
+    let fetched = false;
+    if (cfg.downloader !== 'engine' && it.downloader !== 'engine' && !ariaMissing) {
+      it.downloader = 'aria2';
+      const progress = setInterval(() => { if (Date.now() - lastSave > SAVE_EVERY_MS && it.name) { lastSave = Date.now(); save(it).catch(() => {}); } }, 2000);
+      try {
+        for (let attempt = 1; !fetched; attempt++) {
+          try { await downloadWithAria(it, st); fetched = true; } catch (e) {
+            if (st.canceled || e.fatal) throw e;
+            if (e.code === 'ENOENT' || e.code === 'EACCES') { ariaMissing = true; throw e; }
+            cfg.log('library aria2 attempt failed', it.name || it.infoHash, e.message);
+            if (attempt >= ARIA_ATTEMPTS) throw e;
+            st.note = `${e.message}，重试中`;
+            await sleep(cfg.ariaRetryMs * attempt);
+            if (st.canceled) throw new Error('canceled');
+          }
         }
-      }
-    } finally { clearInterval(progress); }
-    await fsp.rename(partPath(it), filePath(it));
+      } catch (e) {
+        if (st.canceled || e.fatal) throw e;
+        cfg.log('library: aria2 gave up, the engine takes over', it.name || it.infoHash, e.message);
+        await cleanupAria(it);
+        it.downloader = 'engine'; it.downloaded = 0; st.peers = null; st.note = '';
+      } finally { clearInterval(progress); }
+    }
+    if (!fetched) await downloadWithEngine(it, st);
     await fsp.chmod(filePath(it), 0o644).catch(() => {});
     it.probe = await probe(filePath(it));
     it.hash = await oshash(filePath(it), it.size).catch(() => '');
@@ -220,6 +357,7 @@ async function run(it) {
   } finally {
     clearInterval(sampler);
     active.delete(it.id);
+    st.resolve();
     pump();
   }
 }
@@ -237,6 +375,7 @@ function pump() {
 async function init(options) {
   cfg = {
     dir: options.dir, engine: options.engine, log: options.log || (() => {}), ffprobe: options.ffprobe || 'ffprobe',
+    aria2: options.aria2 || 'aria2c', downloader: options.downloader === 'engine' ? 'engine' : 'auto', ariaRetryMs: options.ariaRetryMs || 5000,
     maxBytes: options.maxBytes, minFree: options.minFree, concurrency: Math.max(1, options.concurrency || 1),
     publicBase: (options.publicBase || '').replace(/\/$/, ''), fallbackBase: options.fallbackBase.replace(/\/$/, ''),
     trackers: options.trackers && options.trackers.length ? options.trackers : DEFAULT_TRACKERS,
@@ -248,11 +387,14 @@ async function init(options) {
       const it = JSON.parse(await fsp.readFile(path.join(cfg.dir, name, 'item.json'), 'utf8'));
       if (it.id !== name) continue;
       if (it.state === 'downloading') it.state = 'queued'; // the service was restarted mid-download
-      if (it.state !== 'done') it.downloaded = it.name ? await sizeOf(partPath(it)) : 0;
+      if (it.state !== 'done' && it.downloader !== 'aria2') it.downloaded = it.name ? await sizeOf(partPath(it)) : 0;
       items.set(it.id, it);
     } catch (_) { /* not an item directory */ }
   }
-  cfg.log(`library: ${items.size} items in ${cfg.dir}, quota ${fmtSize(cfg.maxBytes)}`);
+  // An aria2c left behind would keep writing while the restarted service starts another on the same files.
+  process.on('exit', () => { for (const c of children) c.kill('SIGTERM'); });
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => process.exit(0));
+  cfg.log(`library: ${items.size} items in ${cfg.dir}, quota ${fmtSize(cfg.maxBytes)}, downloader ${cfg.downloader === 'engine' ? 'engine' : `${cfg.aria2}, else engine`}`);
   pump();
 }
 
@@ -294,8 +436,8 @@ async function remove(id) {
   const it = items.get(id);
   if (!it) return { error: 'unknown item' };
   const st = active.get(id);
-  if (st) st.cancel();
   items.delete(id);
+  if (st) { st.cancel(); await Promise.race([st.finished, sleep(8000)]); } // aria2 writes its control file on the way out
   await fsp.rm(itemDir(it), { recursive: true, force: true });
   cfg.log('library remove', it.title || it.name);
   return { ok: true };
@@ -325,14 +467,14 @@ function publicItem(it) {
     id: it.id, infoHash: it.infoHash, fileIdx: it.fileIdx, name: it.name, title: it.title, type: it.type, metaId: it.metaId, videoId: it.videoId, poster: it.poster,
     state: it.state, size: it.size, downloaded: it.downloaded, error: it.error, note: st ? st.note : '', speed,
     eta: speed > 0 && it.size ? Math.round((it.size - it.downloaded) / speed) : null,
-    peers: st && es ? Number(es.peers) || 0 : null,
+    peers: !st ? null : st.peers !== null ? st.peers : es ? Number(es.peers) || 0 : null, downloader: it.downloader || '',
     createdAt: it.createdAt, finishedAt: it.finishedAt, webReady: Boolean(it.probe && it.probe.webReady),
     url: it.state === 'done' ? fileUrl(it) : null,
   };
 }
 
 async function list() {
-  if (active.size && Date.now() - engineStatsCache.at > 3000) {
+  if ([...active.keys()].some((id) => (items.get(id) || {}).downloader === 'engine') && Date.now() - engineStatsCache.at > 3000) {
     engineStatsCache = { at: Date.now(), data: await engineJson('/stats.json', { timeout: 4000 }).catch(() => ({})) };
   }
   const all = [...items.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -408,4 +550,4 @@ async function serveFile(req, res, id, name) {
   pipeline(fs.createReadStream(filePath(it), { start, end }), res, () => {});
 }
 
-module.exports = { init, add, remove, retry, list, streamsFor, catalog, findFile, serveFile, _internal: { oshash, sanitizeName, validate } };
+module.exports = { init, add, remove, retry, list, streamsFor, catalog, findFile, serveFile, _internal: { oshash, sanitizeName, validate, torrentFiles } };

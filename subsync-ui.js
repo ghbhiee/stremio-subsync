@@ -1353,7 +1353,7 @@
     if (i.state === 'failed') return '失败：' + (i.error || '');
     if (i.state === 'queued') return '排队中';
     var pct = i.size ? Math.floor(i.downloaded * 100 / i.size) + '%' : fmtSize(i.downloaded);
-    return '下载中 ' + pct + (i.speed ? ' · ' + (i.speed / 1e6).toFixed(1) + ' MB/s' : '') + (i.peers != null ? ' · ' + i.peers + ' 个连接' : '') + (i.note ? ' · ' + i.note : '');
+    return '下载中 ' + pct + (i.speed ? ' · ' + (i.speed / 1e6).toFixed(1) + ' MB/s' : '') + (i.peers != null ? ' · ' + i.peers + ' 个连接' : '') + (i.downloader === 'aria2' ? ' · aria2' : '') + (i.note ? ' · ' + i.note : '');
   }
 
   // The bar above the subtitles menu: one cell about the stream that is playing.

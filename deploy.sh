@@ -16,6 +16,8 @@
 #                     https://media.example.com/library (see examples/nginx-subsync.conf). Without it the
 #                     addon serves the files under its token path.
 #   LIBRARY_MAX_GB    disk quota of the download library (default 50)
+#                     Downloads use aria2c when your distribution's aria2 package is installed (much faster on
+#                     swarms that are hard to connect to) and the streaming engine otherwise.
 #   SERVICE_USER      user the addon runs as (default: stremio)
 #   NODE_BIN          node >= 20 (default: node in PATH, else /opt/stremio-node/bin/node)
 set -euo pipefail
@@ -38,6 +40,7 @@ set_env() { # key value: replace or append a line in the env file
 echo "== checks"
 "$NODE_BIN" -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)' || { echo "node >= 20 required ($NODE_BIN)"; exit 1; }
 command -v ffprobe >/dev/null || { echo "ffprobe (ffmpeg) required"; exit 1; }
+command -v aria2c >/dev/null || echo "note: aria2c not found, library downloads will go through the streaming engine (install the aria2 package for faster downloads)"
 id "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
 
 echo "== code"
