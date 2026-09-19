@@ -11,6 +11,11 @@
 #                     book is then kept per user of your login gateway (see examples/nginx-subsync.conf).
 #                     Without it each browser gets its own book.
 #   VOCAB_NAME_HEADER optional header with a display name for that user (percent-encoded)
+#   LIBRARY_PUBLIC_BASE URL under which your web server serves the download library directory
+#                     (/var/lib/stremio-subsync/library) itself, behind your login, e.g.
+#                     https://media.example.com/library (see examples/nginx-subsync.conf). Without it the
+#                     addon serves the files under its token path.
+#   LIBRARY_MAX_GB    disk quota of the download library (default 50)
 #   SERVICE_USER      user the addon runs as (default: stremio)
 #   NODE_BIN          node >= 20 (default: node in PATH, else /opt/stremio-node/bin/node)
 set -euo pipefail
@@ -37,8 +42,8 @@ id "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --user-group --no-create-
 
 echo "== code"
 install -d $APP
-install -m644 "$S/server.js" "$S/align.js" "$S/translate.js" "$S/dict.js" "$S/vocab.js" $APP/
-for f in server.js align.js translate.js dict.js vocab.js; do "$NODE_BIN" --check $APP/$f; done
+install -m644 "$S/server.js" "$S/align.js" "$S/translate.js" "$S/dict.js" "$S/vocab.js" "$S/library.js" $APP/
+for f in server.js align.js translate.js dict.js vocab.js library.js; do "$NODE_BIN" --check $APP/$f; done
 
 echo "== env file"
 install -d /etc/stremio
@@ -47,6 +52,8 @@ set_env PUBLIC_BASE "$PUBLIC_BASE"
 [ -n "${DEEPSEEK_API_KEY:-}" ] && set_env DEEPSEEK_API_KEY "$DEEPSEEK_API_KEY"
 [ -n "${VOCAB_USER_HEADER:-}" ] && set_env VOCAB_USER_HEADER "$VOCAB_USER_HEADER"
 [ -n "${VOCAB_NAME_HEADER:-}" ] && set_env VOCAB_NAME_HEADER "$VOCAB_NAME_HEADER"
+[ -n "${LIBRARY_PUBLIC_BASE:-}" ] && set_env LIBRARY_PUBLIC_BASE "$LIBRARY_PUBLIC_BASE"
+[ -n "${LIBRARY_MAX_GB:-}" ] && set_env LIBRARY_MAX_GB "$LIBRARY_MAX_GB"
 chown root:"$SERVICE_USER" $ENV_FILE && chmod 640 $ENV_FILE
 TOKEN=$(sed -n 's/^SUBSYNC_TOKEN=//p' $ENV_FILE)
 MANIFEST="$PUBLIC_BASE/$TOKEN/manifest.json"
@@ -74,6 +81,23 @@ if [ -n "${WEB_DIR:-}" ] && [ -f "$WEB_DIR/index.html" ]; then
     cp -n "$WEB_DIR/index.html" "$WEB_DIR/index.html.bak-subsync"
     sed -i 's#</body>#<script src="subsync-ui.js"></script></body>#' "$WEB_DIR/index.html"
   fi
+  echo "== stremio-web player: let hls.js step over small gaps between segments"
+  # stremio-web sets maxBufferHole:0. HEVC passed through from an open-GOP source leaves a gap of a few
+  # frames at every segment boundary; with 0, hls.js reloads the same segment about once a second until
+  # the playhead has crossed the gap (80% of all segment requests in our logs). 0.5 is the hls.js default.
+  for js in "$WEB_DIR"/*/scripts/main.js; do
+    [ -f "$js" ] || continue
+    if grep -q 'maxBufferHole:0,' "$js"; then
+      cp -n "$js" "$js.bak-subsync"
+      sed -i 's/maxBufferHole:0,/maxBufferHole:0.5,/' "$js"
+    fi
+    # the bundle is served as immutable: a new query string makes browsers fetch the patched file
+    rel=${js#"$WEB_DIR"/}
+    if grep -q "src=\"$rel\"" "$WEB_DIR/index.html"; then
+      cp -n "$WEB_DIR/index.html" "$WEB_DIR/index.html.bak-subsync"
+      sed -i "s#src=\"$rel\"#src=\"$rel?subsync=1\"#" "$WEB_DIR/index.html"
+    fi
+  done
 fi
 
 if [ -n "${NGINX_SNIPPET:-}" ]; then

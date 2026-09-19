@@ -1,8 +1,8 @@
 # stremio-subsync · 字幕对齐
 
-自建的 Stremio 字幕插件（addon）：从 OpenSubtitles 拿字幕，**按你正在播放的那个视频文件校正时间轴并按匹配度排序**，能合成**中英双语**字幕，也能用 AI 把英文字幕翻成中文。配套一段注入自托管 stremio-web 的脚本，在播放器里提供双语开关、一键对齐/生成、完成通知、点词查词和逐句快捷键。
+自建的 Stremio 字幕插件（addon）：从 OpenSubtitles 拿字幕，**按你正在播放的那个视频文件校正时间轴并按匹配度排序**，能合成**中英双语**字幕，也能用 AI 把英文字幕翻成中文。配套一段注入自托管 stremio-web 的脚本，在播放器里提供双语开关、一键对齐/生成、完成通知、点词查词和逐句快捷键。还能把整部片**预先下载到服务器**，之后从服务器直接播放，不再依赖种子。
 
-A self-hosted Stremio subtitles addon that aligns OpenSubtitles subtitles to the exact video being played, ranks them, merges Chinese and English into bilingual tracks and machine-translates English into Chinese on demand, plus a web-player companion script (bilingual switch, notifications, click-to-look-up words, sentence navigation keys).
+A self-hosted Stremio subtitles addon that aligns OpenSubtitles subtitles to the exact video being played, ranks them, merges Chinese and English into bilingual tracks and machine-translates English into Chinese on demand, plus a web-player companion script (bilingual switch, notifications, click-to-look-up words, sentence navigation keys). It can also download whole videos to the server ahead of time and list them first among the streams, so playback no longer depends on the swarm.
 
 ## 功能
 
@@ -18,6 +18,8 @@ A self-hosted Stremio subtitles addon that aligns OpenSubtitles subtitles to the
 - **逐句快捷键**：显示字幕时（插件字幕或内嵌字幕都行）`A` 回到上一句、`S` 重听本句、`D` 下一句（没有字幕时这三个键保持 Stremio 原来的功能）；`E` 播放/暂停。
 - **逐句暂停（精听）**：按 `Q` 打开后，每句字幕快播完时自动停住（停在句末前一点，字幕还留在屏幕上，可以继续点词），学完按 `D` 进入下一句，`S` 重听、`A` 上一句、`E` 直接继续。开关状态和每个按键的说明都在字幕菜单上方的工具条里（说明可以直接点，平板没有键盘也能用），画面上不加任何东西。状态记在浏览器里。
 - **生词本**：点词弹窗右上角的「＋ 生词本」把单词连同音标、释义、句中意思、所在句子、片名和时间点一起保存；已保存的显示「✓ 已在生词本」，再点一次移除。播放器底部控制条多一个书本图标，点开后在右侧列出全部生词（可切换「全部 / 本片」、删除），点例句跳回那句话（不是当前影片时会先打开那部片）。**生词本存在服务器上、按用户分开**，见下面的「生词本的用户」。
+- **下载到服务器（片库）**：播放时在字幕菜单上方的工具条点「下载到服务器」，或在影片详情页点顶栏的下载图标、在右侧面板里挑一个种子片源，服务器就在后台把整部片下完。做法是让本机的 streaming server 把这个文件从头读到尾（它会按顺序取齐所有分片并照常校验），所以**下载期间照常能看**：你播放的是同一个种子，和下载共用已经取到的分片；下载中的片子在片源列表里显示为「下载中 42% · 可边下边播」。下完之后，这部片的片源列表**第一条**就是「已下载 · 服务器本地」，从磁盘直接读，拖动秒开，做种的人都走了也能看；首页还多一个「已下载」目录。下载时会在片源自带的 tracker 之外补一批公共 tracker。任务状态落盘，服务重启后从断点继续；连接中断或长时间没数据会自动重试。面板里能看每个任务的进度、速度、连接数和剩余时间，看片库占用和磁盘剩余，取消下载或删除（删除要点两次确认）。片库有配额（默认 50 GB）并保证磁盘留有余量（默认 10 GB），超了就拒绝新任务。浏览器能直接播的文件（MP4 + H.264 + AAC）由网页服务器按 Range 直接发；其余（MKV、HEVC、AC3 等）仍经 streaming server 转封装，只是数据源换成了本地文件。从片库播放时字幕对齐读的也是本地文件。
+- **修掉播放器反复重取同一分片的问题**：stremio-web 把 hls.js 的 `maxBufferHole` 设成了 0。x265 片源多数是 open-GOP，浏览器能解 HEVC 时 streaming server 直接转封装，每个分片交界处会留下零点几秒的空洞；`maxBufferHole` 为 0 时 hls.js 认为缓冲到此为止，于是每秒重新下载同一个分片，直到播放头自己越过空洞。我们的日志里 Chrome 下 80% 的视频分片请求是这种重复请求（一个分片最多被取了 1205 次），带宽小一点就表现为「完全播不动」。`deploy.sh` 会把自托管网页包里的这个值改回 hls.js 的默认值 0.5，并给脚本地址加版本参数让浏览器取到新文件。
 - **原生客户端兜底**：没有注入脚本的 Stremio 客户端（Mac、手机、电视）在英文列表末尾能看到「▶ 对齐全部字幕」、中文列表末尾能看到「▶ 生成 AI 中文字幕」，选中即开始，稍后重新选一次字幕就能拿到结果。
 - **自动预装（可选）**：自托管 stremio-web 时，注入脚本自动装好 Torrentio、MediaFusion 和本插件，并卸掉被本插件替代的 OpenSubtitles v3。
 
@@ -73,10 +75,14 @@ sudo PUBLIC_BASE=https://media.example.com/subsync \
 - `NGINX_SNIPPET`：一个已被 HTTPS server 块 include 的 nginx 文件，脚本会追加 `examples/nginx-subsync.conf` 并在 `nginx -t` 通过后 reload。不填就手动把示例加进你的配置。
 - `WEB_DIR`：自托管 stremio-web 的目录，填了才把预装脚本和播放器脚本（`subsync-ui.js`）挂进 `index.html`。不填也能用插件本身，只是没有开关、通知、查词、快捷键和生词本。
 - `VOCAB_USER_HEADER`（可选）：你的登录网关通过反向代理传来的「当前用户」请求头名，见下一节。
+- `LIBRARY_PUBLIC_BASE`（可选）：片库目录（`/var/lib/stremio-subsync/library`）由你的网页服务器直接对外提供时的地址前缀，例如 `https://media.example.com/library`，写法见 `examples/nginx-subsync.conf`（放在登录校验后面，nginx 自己处理 Range 和 sendfile）。注意 streaming server 转封装时是从本机去读这个地址的，没有登录 cookie，你的网关要像放行它读自己的流那样放行这个路径。不填则由插件进程在 token 路径下提供文件（`<PUBLIC_BASE>/<token>/lib/...`），功能一样。
+- `LIBRARY_MAX_GB`（可选）：片库配额，默认 50。
 
 装好后，在 Stremio 的 Addons 页面安装 `PUBLIC_BASE/<SUBSYNC_TOKEN>/manifest.json`，token 在 `/etc/stremio/subsync.env` 里。**这个地址本身就是访问凭证，不要公开。** 其余配置项见 `examples/subsync.env.example`。
 
 升级：`git pull` 后用同样的命令再跑一次 `deploy.sh`（幂等，已有的 token 和 key 保留）。
+
+**从 1.3 升到 1.4 要注意**：插件的 manifest 多了 `stream` 和 `catalog` 两种资源，而 Stremio 的用户档案里保存的是安装时的那份 manifest，不会自己更新。自托管网页端由预装脚本处理：发现服务器上的版本更新就原位升级，并且一次性把它自己装的 Torrentio、MediaFusion 挪到本插件后面（Stremio 的片源列表按插件安装顺序排，这样「已下载」才排第一）。其它客户端（Mac、手机、电视上的 Stremio）要手动卸载本插件再装一次；想让「已下载」排在最前，还得把种子类插件也卸载重装一遍，让它们排到后面。
 
 ### 生词本的用户
 
@@ -86,6 +92,16 @@ sudo PUBLIC_BASE=https://media.example.com/subsync \
 - **登录网关（`header`）**：站点前面有登录网关（nginx `auth_request`、Authelia、oauth2-proxy……）时，让反向代理校验登录后把用户名放进一个请求头，并设置 `VOCAB_USER_HEADER=<头名>`。此时没有这个头的请求一律 401，浏览器自报的 ID 不再起作用，同一个人在不同设备上是同一本。nginx 写法见 `examples/nginx-subsync.conf`：给 `/subsync/<token>/vocab` 单独一个带 `auth_request` 的 location，并在普通的 `/subsync/` location 里把这个头清空，防止客户端伪造。`VOCAB_NAME_HEADER` 可再传一个显示名（URL 编码）。
 
 数据在 `<CACHE_DIR>/vocab/`，每个用户一个 JSON 文件（文件名是用户 ID 的哈希，权限 600）。同一个人有多个 ID 时，在 `<CACHE_DIR>/vocab/aliases.json` 里写 `{"p:1": "dad", "p:3": "dad"}`（`p:` 是网关给的 ID，`c:` 是浏览器 ID），它们就共用 `dad` 这一本，各自原来的生词在第一次访问时自动并入。
+
+## 播放慢的时候先量什么
+
+这次排查用到的办法，换一套部署也适用：
+
+- **分片有没有被重复请求**：在反向代理的访问日志里数 `/hlsv2/<会话>/video0/segmentN.m4s`，同一个会话里同一个 N 出现几十上百次就是上面说的 `maxBufferHole` 问题。
+- **每个请求花了多久、慢在哪一端**：给流媒体的 location 单独加一个带 `$request_time`、`$upstream_response_time`、`$tcpinfo_rtt`、`$tcpinfo_snd_cwnd` 的 `log_format`（只记 `$uri`，别把带 token 的查询串写进去）。RTT 高、拥塞窗口只有个位数，问题在观众那头的网络；`upstream_response_time` 高，问题在 streaming server 或种子。
+- **服务器自己的链路**：streaming server 既要下载种子又要往外发，走 Wi-Fi 时两者共用空口时间。先看连的是不是 5 GHz，再用一个镜像站的大文件测下行。我们的机器重启后掉到 2.4 GHz，整条链路只有 30 Mbps。
+- **种子本身**：streaming server 的 `/<infoHash>/<fileIdx>/stats.json` 里有 `peers`、`unchoked`、`downloadSpeed`。同一个种子用 aria2 对照下载一分钟，能看出是种子慢还是下载器连不上 peer。
+- 远程观看时 `net.ipv4.tcp_congestion_control=bbr`、`net.ipv4.tcp_slow_start_after_idle=0` 对一片一片取的 HLS 有帮助。
 
 ## 接口（供二次开发）
 
@@ -99,6 +115,9 @@ sudo PUBLIC_BASE=https://media.example.com/subsync \
 | `action/<video>`（POST JSON） | `{"align":true}`、`{"translate":true}`、`{"bilingual":true}`（对齐 + 翻译）、加 `"force":true` 用当前最佳英文重新翻译 |
 | `dict?q=<词>&ctx=<句子>` | 查词 |
 | `tts?q=<词或短语>[&accent=uk]` | 发音（mp3，取自有道 `dictvoice`，缓存在 `<CACHE_DIR>/tts/`） |
+| `stream/<type>/<id>.json`、`catalog/<type>/subsync-library.json` | Stremio 插件协议：这部片在片库里的文件（下完的给本地地址，下载中的给种子片源），以及「已下载」目录 |
+| `library` | 片库：`GET` 列出任务和占用 `{items[], usage{used,max,free}}`；`POST` JSON `{infoHash, fileIdx, sources[], filename, size, title, type, metaId, videoId, poster}` 新建下载（同一个文件再次提交返回原任务）；`DELETE library/<id>` 取消或删除；`POST library/<id>/retry` 重试失败的任务 |
+| `lib/<id>/<文件名>` | 下好的文件，支持 Range（只在没设 `LIBRARY_PUBLIC_BASE` 时使用） |
 | `vocab` | 生词本：`GET` 列出当前用户的生词；`POST` JSON `{word, phonetic, entries[], meaning, sentence, sentenceZh, title, time, video{id,type,metaId,href}}` 添加（同一个词再次提交是补全）；`DELETE ?word=<词>` 移除。用户来自 `VOCAB_USER_HEADER` 指定的头，或请求头 `X-Subsync-Profile`（16–64 位字母数字），都没有则 401 |
 
 `<video>` 是列表里字幕 URL 中的 16 位视频键。

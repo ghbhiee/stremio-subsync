@@ -4,6 +4,8 @@
 // and English into bilingual tracks and machine-translates the best English subtitle into Chinese.
 // Listing subtitles never starts any work: alignment and translation run only through the action
 // endpoint (used by the web UI script, subsync-ui.js) or when a client selects one of the "▶" entries.
+// It also keeps a library of videos downloaded to this server ahead of time (library.js) and lists them
+// as streams, first in the list, and as a catalog.
 'use strict';
 
 const http = require('http');
@@ -16,6 +18,7 @@ const { align, cueMatch, speechFromRms, parseSrt, formatSrt } = require('./align
 const translate = require('./translate');
 const dict = require('./dict');
 const vocab = require('./vocab');
+const library = require('./library');
 
 const PORT = Number(process.env.PORT || 11480);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -55,6 +58,13 @@ const MT_LANG = 'chi'; // Simplified Chinese variants are listed as "chi": one �
 const TRAD_LANG = process.env.TRAD_LANG || '繁体中文';
 const TRAD_CODES = new Set(['zht', 'cht']);
 const CHT = new Set(CHI); // same codes; bestEntry(job, CHT) means "Traditional entries only"
+// Library of downloaded videos. LIBRARY_PUBLIC_BASE is the URL under which a web server serves
+// LIBRARY_DIR itself (behind your login, with Range and sendfile); without it this process serves the
+// files under the token path.
+const LIBRARY_DIR = process.env.LIBRARY_DIR || path.join(CACHE_DIR, 'library');
+const LIBRARY_MAX_BYTES = Number(process.env.LIBRARY_MAX_GB || 50) * 1e9;
+const LIBRARY_MIN_FREE = Number(process.env.LIBRARY_MIN_FREE_GB || 10) * 1e9;
+const LIBRARY_PUBLIC_BASE = process.env.LIBRARY_PUBLIC_BASE || '';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
 
 if (!TOKEN || !PUBLIC_BASE) {
@@ -64,13 +74,13 @@ if (!TOKEN || !PUBLIC_BASE) {
 
 const MANIFEST = {
   id: 'com.tokencv.subsync',
-  version: '1.3.0',
+  version: '1.4.0',
   name: '字幕对齐',
-  description: 'OpenSubtitles 字幕：按需对齐时间轴并排序，提供中英双语与 AI 翻译中文字幕（对齐和翻译都由用户触发）',
-  resources: ['subtitles'],
+  description: 'OpenSubtitles 字幕：按需对齐时间轴并排序，提供中英双语与 AI 翻译中文字幕（对齐和翻译都由用户触发）；已下载到服务器的影片排在片源列表最前',
+  resources: ['subtitles', 'stream', 'catalog'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
-  catalogs: [],
+  catalogs: [{ type: 'movie', id: 'subsync-library', name: '已下载' }, { type: 'series', id: 'subsync-library', name: '已下载' }],
 };
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -113,6 +123,14 @@ async function findVideo(size, filename) {
   return hits[0] || null;
 }
 
+// A video played from the library is not in the engine: alignment then reads the file on disk. A
+// downloaded copy also wins over the engine's, which may hold only part of the file.
+async function locateVideo(size, filename) {
+  const local = library.findFile(size, filename);
+  if (local && local.exact) return local;
+  return (await findVideo(size, filename).catch(() => null)) || local;
+}
+
 // Stremio asks for subtitles first with only a file name, then again with videoSize/videoHash, and
 // stremio-web keys addon subtitles by list position ("<addon>_<index>"), keeping the first one it saw.
 // Different lists for the two requests therefore drop entries. Resolve size and hash of a file-name-only
@@ -123,9 +141,10 @@ async function resolveVideoParams(params) {
   const filename = params.get('filename') || '';
   if (size && hash) return { size, hash, filename };
   if (!filename) return null;
-  const video = await findVideo(size, filename).catch(() => null);
+  const video = await locateVideo(size, filename).catch(() => null);
   if (!video) return null;
   size = size || String(video.length);
+  if (!hash && video.hash) hash = video.hash; // library file: hashed when its download finished
   if (!hash) {
     if (!hashCache.has(video.url)) {
       const res = await fetchText(`${ENGINE}/opensubHash?videoUrl=${encodeURIComponent(video.url)}`, 20000).then(JSON.parse).catch(() => null);
@@ -362,7 +381,7 @@ function startAlign(job) {
   job.alignPromise = (async () => {
     await fsp.mkdir(job.dir, { recursive: true });
     if (!job.ref) {
-      const video = await findVideo(job.size, job.filename).catch((e) => { log('engine lookup failed', e.message); return null; });
+      const video = await locateVideo(job.size, job.filename).catch((e) => { log('engine lookup failed', e.message); return null; });
       if (video) {
         job.videoUrl = video.url;
         job.align.phase = 'reference';
@@ -775,6 +794,30 @@ async function handleVocab(req, res, url) {
   send(res, 405, { error: 'method not allowed' });
 }
 
+// ---------- library of downloaded videos ----------
+
+// GET lists items and disk usage, POST queues a download ({infoHash, fileIdx, sources, filename, size,
+// title, type, metaId, videoId, poster}), DELETE /library/<id> removes one, POST /library/<id>/retry
+// restarts a failed one.
+async function handleLibrary(req, res, rest) {
+  if (rest.length === 1 && req.method === 'GET') return send(res, 200, { ok: true, ...(await library.list()) });
+  if (rest.length === 1 && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse((await readBody(req, 32768)) || '{}'); } catch (_) { return send(res, 400, { error: 'bad json' }); }
+    const out = await library.add(body);
+    return send(res, out.error ? 400 : 200, out.error ? out : { ok: true, ...out });
+  }
+  if (rest.length === 2 && req.method === 'DELETE') {
+    const out = await library.remove(rest[1]);
+    return send(res, out.error ? 404 : 200, out);
+  }
+  if (rest.length === 3 && rest[2] === 'retry' && req.method === 'POST') {
+    const out = await library.retry(rest[1]);
+    return send(res, out.error ? 404 : 200, out.error ? out : { ok: true, ...out });
+  }
+  send(res, 405, { error: 'method not allowed' });
+}
+
 // ---------- HTTP plumbing ----------
 
 // The streaming engine fetches subtitle files with a 10 s timeout that is cleared once response headers
@@ -807,10 +850,17 @@ http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const parts = url.pathname.split('/').filter(Boolean);
     if (req.method === 'OPTIONS') return send(res, 204, '');
-    if (parts[0] === 'health') return send(res, 200, { ok: true, version: MANIFEST.version, jobs: jobs.size, translation: translate.enabled() ? translate.MODEL : false, vocab: vocab.mode() });
+    if (parts[0] === 'health') return send(res, 200, { ok: true, version: MANIFEST.version, jobs: jobs.size, translation: translate.enabled() ? translate.MODEL : false, vocab: vocab.mode(), library: LIBRARY_PUBLIC_BASE ? 'web server' : 'built-in' });
     if (parts[0] !== TOKEN) return send(res, 404, 'not found');
     const rest = parts.slice(1);
     if (rest[0] === 'manifest.json') return send(res, 200, MANIFEST);
+    if (rest[0] === 'stream' && rest.length === 3) return send(res, 200, { streams: library.streamsFor(decodeURIComponent(rest[2]).replace(/\.json$/, '')), cacheMaxAge: 0 });
+    if (rest[0] === 'catalog' && rest.length >= 3) { // extras (skip=N) mean a further page: there is only one
+      const paged = rest.length > 3 && /skip=[1-9]/.test(rest[3]);
+      return send(res, 200, { metas: paged ? [] : library.catalog(rest[1]), cacheMaxAge: 0 });
+    }
+    if (rest[0] === 'library') return await handleLibrary(req, res, rest);
+    if (rest[0] === 'lib' && rest.length === 3 && (req.method === 'GET' || req.method === 'HEAD')) return await library.serveFile(req, res, rest[1], decodeURIComponent(rest[2]));
     if (rest[0] === 'subtitles' && rest.length >= 3) {
       // Keep the extra args exactly as Stremio encoded them: they are forwarded upstream verbatim.
       const [rawId, ...rawExtra] = req.url.split('?')[0].split('/').slice(4);
@@ -844,3 +894,9 @@ http.createServer(async (req, res) => {
     else res.end();
   }
 }).listen(PORT, HOST, () => log(`subsync ${MANIFEST.version} listening on http://${HOST}:${PORT} (translation: ${translate.enabled() ? translate.MODEL : 'off'})`));
+
+library.init({
+  dir: LIBRARY_DIR, engine: ENGINE, log, ffprobe: FFPROBE, maxBytes: LIBRARY_MAX_BYTES, minFree: LIBRARY_MIN_FREE,
+  concurrency: Number(process.env.LIBRARY_CONCURRENCY || 1), publicBase: LIBRARY_PUBLIC_BASE, fallbackBase: `${PUBLIC_BASE}/${TOKEN}/lib`,
+  trackers: (process.env.LIBRARY_TRACKERS || '').split(',').map((t) => t.trim()).filter(Boolean),
+}).catch((e) => log('library init failed', e.message));

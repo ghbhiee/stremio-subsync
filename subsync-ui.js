@@ -6,8 +6,10 @@
 // to "pause after every sentence", pauses while the mouse rests on the subtitle and shows a Chinese
 // dictionary entry when an English word is clicked, for addon subtitles and for subtitle tracks embedded
 // in the video alike. Words can be saved from that popup into a vocabulary book kept on the server (one
-// per user); a button in the control bar opens it in a panel on the right. Everything is best-effort:
-// if the player's internals cannot be found, the stock UI keeps working unchanged.
+// per user); a button in the control bar opens it in a panel on the right. The same panel has a second
+// page for downloads to the server (the addon's library): start one for the stream that is playing or for
+// any torrent stream of the title that is open, watch the progress, see what is stored and delete it.
+// Everything is best-effort: if the player's internals cannot be found, the stock UI keeps working unchanged.
 (function () {
   'use strict';
 
@@ -32,7 +34,8 @@
     menuObserver: null, videoObserver: null, bar: null, barKey: '', wantMt: false, wantBi: false, biApplied: false, internalSelect: false,
     embeddedId: null, embTrack: null, embEl: null,
     timeOffset: 0, spTimer: null, spDone: null, spWait: null, pausedBySentence: false, hoverSuppressed: false,
-    meta: null, pendingSeek: null, vbtn: null, panel: null, panelOpen: false,
+    meta: null, pendingSeek: null, vbtn: null, dbtn: null, nbtn: null, panel: null, panelOpen: false, panelMode: 'vocab', panelPressed: false, panelDirty: false,
+    lib: { items: [], usage: null, loaded: false, error: '', timer: null, confirm: null }, page: null,
     vocab: { loaded: false, loading: null, words: {}, user: null, error: '' },
     embStyle: { size: 100, offset: 0, offsetMin: 0, color: 'rgb(255, 255, 255)', bg: 'rgba(0, 0, 0, 0)', outline: 'rgb(34, 34, 34)' },
   };
@@ -114,6 +117,12 @@
     '.ss-vi .ss-vd{position:absolute;top:.6rem;right:0;cursor:pointer;opacity:.45;font-size:1.1rem;padding:0 .3rem}.ss-vi .ss-vd:hover{opacity:1}',
     '.ss-vi .ss-vs{margin-top:.35rem;padding:.35rem .55rem;border-radius:.4rem;background:rgba(255,255,255,.07)}.ss-vi .ss-vs.go{cursor:pointer}.ss-vi .ss-vs.go:hover{background:rgba(255,255,255,.14)}',
     '.ss-vi .ss-vz{opacity:.75;font-size:.88rem}.ss-vi .ss-vm{margin-top:.3rem;opacity:.55;font-size:.8rem}',
+    '.ss-panel.ss-fixed{position:fixed;top:4.5rem;z-index:1000}',
+    '.ss-lsec{margin:.9rem 0 .2rem;font-size:.8rem;opacity:.6;letter-spacing:.05em}',
+    '.ss-li{padding:.65rem 0;border-top:1px solid rgba(255,255,255,.12)}.ss-li .ss-lt{font-weight:700;word-break:break-word}.ss-li .ss-ln{opacity:.6;font-size:.8rem;word-break:break-all}',
+    '.ss-li .ss-lr{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem .6rem;margin-top:.35rem;font-size:.85rem}.ss-li .ss-lr .ss-btn{font-size:.8rem}',
+    '.ss-btn.ss-ghost{background:rgba(255,255,255,.14)}.ss-btn.ss-warn{background:#c0392b}',
+    '.ss-lp{height:.3rem;margin-top:.4rem;border-radius:.2rem;background:rgba(255,255,255,.15);overflow:hidden}.ss-lp>i{display:block;height:100%;background:var(--secondary-accent-color,#7b5bf5)}',
     '.ss-keys{flex-wrap:wrap;gap:.3rem .5rem}.ss-key{display:flex;align-items:center;gap:.3rem;cursor:pointer;padding:.1rem .5rem .1rem .25rem;border-radius:1rem;background:rgba(255,255,255,.1);font-size:.85rem}.ss-key:hover{background:rgba(255,255,255,.22)}',
     '.ss-kbd{flex:none;padding:0 .4rem;border:1px solid rgba(255,255,255,.45);border-radius:.3rem;font-size:.8rem;line-height:1.35;opacity:.9}',
   ].join('\n');
@@ -207,7 +216,7 @@
     if (st.embEl && st.embEl.parentNode) st.embEl.parentNode.removeChild(st.embEl);
     removeBar();
     closePanel();
-    st.vbtn = null; st.hovering = false;
+    st.vbtn = null; st.dbtn = null; st.hovering = false;
     st.video = null; st.videoEl = null; st.subsEl = null; st.embTrack = null; st.embEl = null; st.embeddedId = null;
     if (st.menuObserver) { st.menuObserver.disconnect(); st.menuObserver = null; }
     if (st.videoObserver) { st.videoObserver.disconnect(); st.videoObserver = null; }
@@ -229,6 +238,7 @@
     if (v && v !== st.videoEl) bind(v);
     else if (!v && st.videoEl) unbind();
     else if (v && st.videoEl && !document.contains(st.videoEl)) unbind();
+    ensureNavButton();
   }, 1000);
 
   // ---------- server state ----------
@@ -494,7 +504,7 @@
   function scheduleMenu() { // setTimeout, not requestAnimationFrame: the latter stops in a background tab
     if (menuScheduled) return;
     menuScheduled = true;
-    setTimeout(function () { menuScheduled = false; ensureVocabButton(); renderMenu(); }, 30);
+    setTimeout(function () { menuScheduled = false; ensureVocabButton(); ensureDownloadButton(); renderMenu(); }, 30);
   }
   window.addEventListener('resize', scheduleMenu);
   function findMenu() {
@@ -595,7 +605,7 @@
     var s = st.status, p = mine(selectedTrack());
     var biNow = isBilingual(p), hover = pref(LS_HOVER, true), sp = spOn, voiceOn = pref(LS_VOICE, true);
     var key = JSON.stringify([st.shortKey, !s ? null : s.missing ? 'missing' : [s.align.state, s.align.running, s.align.phase, s.align.done, s.align.total, s.align.error,
-      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, sp, voiceOn, st.selectedId, st.embeddedId, st.wantBi]);
+      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, sp, voiceOn, st.selectedId, st.embeddedId, st.wantBi, downloadKey()]);
     if (key === st.barKey) return; // nothing changed: leave the DOM alone (the menu observer would loop otherwise)
     st.barKey = key;
     bar.textContent = '';
@@ -626,6 +636,8 @@
         }
       }
     }
+    var ds = downloadCell();
+    if (ds) bar.appendChild(ds);
     // Sentence pause: whether it is on, and what every key does (the keys can be clicked too: tablets).
     var spSw = el('div', 'ss-sw' + (sp ? ' on' : ''));
     spSw.addEventListener('click', function () { setSentencePause(!spOn, false); });
@@ -1119,8 +1131,8 @@
       if (title && si && typeof si.season === 'number' && typeof si.episode === 'number') title += ' S' + (si.season < 10 ? '0' : '') + si.season + 'E' + (si.episode < 10 ? '0' : '') + si.episode;
       var video = { id: path && path.id ? String(path.id) : '', type: path && path.type ? String(path.type) : (item && item.type) || '', metaId: item && item.id ? String(item.id) : '' };
       if (/^#\/player\//.test(href) && href.length <= 3000) video.href = href;
-      st.meta = { title: title, video: video };
-      renderPanel();
+      st.meta = { title: title, video: video, poster: item && typeof item.poster === 'string' ? item.poster : '', stream: streamSpec(sel.stream) };
+      renderPanel(); st.barKey = ''; renderBar();
       return st.meta;
     }).catch(function () { return st.meta; });
   }
@@ -1175,7 +1187,7 @@
     var b = st.vbtn;
     if (!b) {
       b = st.vbtn = el('div');
-      b.addEventListener('click', function (e) { e.stopPropagation(); togglePanel(); });
+      b.addEventListener('click', function (e) { e.stopPropagation(); togglePanel('vocab'); });
       b.addEventListener('mousedown', function (e) { e.stopPropagation(); });
     }
     b.className = String(sample.className).split(/\s+/).filter(function (c) { return c && c !== 'disabled' && c !== 'active'; }).concat('ss-vbtn').join(' ');
@@ -1189,13 +1201,14 @@
     svg.appendChild(path); b.appendChild(svg);
     host.insertBefore(b, host.firstChild);
   }
-  function togglePanel() { if (st.panelOpen) closePanel(); else openPanel(); }
+  function togglePanel(mode) { if (st.panelOpen && st.panelMode === (mode || st.panelMode)) closePanel(); else openPanel(mode); }
   function closePanel() {
-    st.panelOpen = false;
+    st.panelOpen = false; st.lib.confirm = null;
     if (st.panel && st.panel.parentNode) st.panel.parentNode.removeChild(st.panel);
   }
-  function openPanel() {
-    var root = st.root || document.body;
+  function openPanel(mode) {
+    if (mode) st.panelMode = mode;
+    var root = st.video ? (st.root || document.body) : document.body; // outside the player the panel hangs on the page itself
     if (!st.panel) {
       st.panel = el('div', 'ss-panel');
       st.panel.__onlyThis = false;
@@ -1203,30 +1216,41 @@
       ['wheel', 'touchstart', 'touchmove', 'touchend', 'contextmenu'].forEach(function (t) { st.panel.addEventListener(t, function (e) { e.stopPropagation(); }, { passive: true }); });
     }
     if (st.panel.parentNode !== root) root.appendChild(st.panel);
+    st.panel.classList.toggle('ss-fixed', !st.video);
     // Stay clear of the control bar: its buttons (this panel's own among them) remain usable.
-    var cb = document.querySelector('[class*="control-bar-container"]'), rr = root.getBoundingClientRect();
+    var cb = st.video ? document.querySelector('[class*="control-bar-container"]') : null, rr = root.getBoundingClientRect();
     var gap = cb ? Math.round(rr.bottom - cb.getBoundingClientRect().top) : 0;
     st.panel.style.bottom = (gap > 0 && gap < rr.height / 2 ? gap : 0) + 'px';
     st.panelOpen = true;
     renderPanel();
-    refreshMeta();
-    ensureVocab(true);
+    if (st.video) refreshMeta();
+    if (st.panelMode === 'library') { refreshPage(); refreshLibrary(); } else ensureVocab(true);
   }
   function fmtDate(iso) { var m = /^\d{4}-(\d\d)-(\d\d)/.exec(String(iso || '')); return m ? m[1] + '-' + m[2] : ''; }
+  function panelHead(panel, note) { // the two pages of the panel, and the close button
+    var head = el('div', 'ss-vh');
+    [['生词本', 'vocab'], ['下载', 'library']].forEach(function (m) {
+      var t = el('span', 'ss-vt', m[0]);
+      if (st.panelMode !== m[1]) { t.style.opacity = '.45'; t.style.cursor = 'pointer'; t.__ssAct = function () { openPanel(m[1]); }; }
+      head.appendChild(t);
+    });
+    if (note) head.appendChild(el('span', 'ss-muted', note));
+    var x = el('span', 'ss-vx', '×'); x.title = '关闭（Esc）'; x.__ssAct = closePanel;
+    head.appendChild(x);
+    panel.appendChild(head);
+  }
   function renderPanel() {
     var panel = st.panel;
     if (!panel || !st.panelOpen) return;
+    // a redraw between mousedown and mouseup would replace the node under the mouse and lose the click
+    if (st.panelPressed) { st.panelDirty = true; return; }
+    if (st.panelMode === 'library') { renderLibrary(panel); return; }
     var scroll = panel.querySelector('.ss-vl'), keep = scroll ? scroll.scrollTop : 0;
     var all = Object.keys(st.vocab.words).map(function (k) { return st.vocab.words[k]; })
       .sort(function (a, b) { return String(b.addedAt || '').localeCompare(String(a.addedAt || '')); });
     var here = all.filter(sameVideo), items = panel.__onlyThis ? here : all;
     panel.textContent = '';
-    var head = el('div', 'ss-vh');
-    head.appendChild(el('span', 'ss-vt', '生词本'));
-    head.appendChild(el('span', 'ss-muted', all.length + ' 个' + (st.vocab.user && st.vocab.user.name ? ' · ' + st.vocab.user.name : '')));
-    var x = el('span', 'ss-vx', '×'); x.title = '关闭（Esc）'; x.__ssAct = closePanel;
-    head.appendChild(x);
-    panel.appendChild(head);
+    panelHead(panel, all.length + ' 个' + (st.vocab.user && st.vocab.user.name ? ' · ' + st.vocab.user.name : ''));
     var tabs = el('div', 'ss-vtabs');
     [['全部 ' + all.length, false], ['本片 ' + here.length, true]].forEach(function (t) {
       var tab = el('span', 'ss-vtab' + (panel.__onlyThis === t[1] ? ' on' : ''), t[0]);
@@ -1264,6 +1288,225 @@
     list.scrollTop = keep;
   }
 
+  // ---------- downloads to the server (the addon's library) ----------
+
+  var DL_ICON = 'M12 3a1 1 0 0 1 1 1v9.6l3.3-3.3a1 1 0 1 1 1.4 1.4l-5 5a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l3.3 3.3V4a1 1 0 0 1 1-1zM5 19a1 1 0 1 0 0 2h14a1 1 0 1 0 0-2H5z';
+  function fmtSize(n) { n = Number(n) || 0; return n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB' : Math.round(n / 1e6) + ' MB'; }
+  function fmtEta(sec) { if (sec == null) return ''; return sec >= 3600 ? Math.floor(sec / 3600) + ' 小时 ' + Math.round(sec % 3600 / 60) + ' 分' : sec >= 60 ? Math.round(sec / 60) + ' 分钟' : '不到 1 分钟'; }
+
+  // What the library needs to know about a torrent stream (null for anything else).
+  function streamSpec(stream) {
+    if (!stream || typeof stream.infoHash !== 'string' || !/^[0-9a-f]{40}$/i.test(stream.infoHash)) {
+      return stream && typeof stream.url === 'string' && /\/(library|lib)\/[0-9a-f]{16}\//.test(stream.url) ? { local: true } : null;
+    }
+    var bh = stream.behaviorHints || {}, src = stream.announce || stream.sources || [];
+    return { infoHash: stream.infoHash.toLowerCase(), fileIdx: typeof stream.fileIdx === 'number' ? stream.fileIdx : null,
+      sources: src.filter(function (x) { return typeof x === 'string'; }).map(function (x) { return /^(tracker|dht):/.test(x) ? x : 'tracker:' + x; }).slice(0, 60),
+      filename: typeof bh.filename === 'string' ? bh.filename : '', size: Number(bh.videoSize) || 0 };
+  }
+  function libItem(spec) {
+    if (!spec || !spec.infoHash) return null;
+    var hit = null;
+    st.lib.items.forEach(function (i) { if (i.infoHash === spec.infoHash && (spec.fileIdx === null || i.fileIdx === null || i.fileIdx === spec.fileIdx)) hit = hit || i; });
+    return hit;
+  }
+  function libFetch(method, tail, body) {
+    return fetch(BASE + '/library' + (tail || ''), { method: method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  function libBusy() { return st.lib.items.some(function (i) { return i.state === 'queued' || i.state === 'downloading'; }); }
+  function refreshLibrary() {
+    return libFetch('GET').then(function (j) {
+      var before = {};
+      st.lib.items.forEach(function (i) { before[i.id] = i.state; });
+      st.lib.items = j.items || []; st.lib.usage = j.usage || null; st.lib.error = '';
+      if (st.lib.loaded) st.lib.items.forEach(function (i) {
+        if (before[i.id] === i.state || !before[i.id]) return;
+        if (i.state === 'done') toast('已下载到服务器：' + (i.title || i.name) + '。下次打开这部片，片源列表第一条就是它。', 'success', 10000);
+        else if (i.state === 'failed') toast('下载失败：' + (i.title || i.name) + '（' + i.error + '）', 'error', 10000);
+      });
+      st.lib.loaded = true;
+    }).catch(function (e) { st.lib.error = e.message; }).then(function () { renderPanel(); renderBar(); scheduleLibPoll(); });
+  }
+  // Every 3 s while someone is looking (the panel's download page, or the bar during a download), else
+  // every 20 s while a download runs, so that its end is still announced.
+  function scheduleLibPoll() {
+    if (st.lib.timer) return;
+    var looking = (st.panelOpen && st.panelMode === 'library') || (libBusy() && st.bar && st.bar.parentNode);
+    if (!looking && !libBusy()) return;
+    st.lib.timer = setTimeout(function () { st.lib.timer = null; refreshLibrary(); }, looking ? 3000 : 20000);
+  }
+  function startDownload(spec, info) {
+    var body = { infoHash: spec.infoHash, fileIdx: spec.fileIdx, sources: spec.sources, filename: spec.filename, size: spec.size,
+      title: info.title || '', type: info.type || '', metaId: info.metaId || '', videoId: info.videoId || '', poster: info.poster || '' };
+    return libFetch('POST', '', body).then(function (j) {
+      toast(j.existed ? '这个片源已经在服务器的下载列表里' : '已加入服务器下载：' + (info.title || spec.filename || ''), 'info', 5000);
+      return refreshLibrary();
+    }).catch(function (e) { toast('无法下载：' + e.message, 'error', 9000); });
+  }
+  function playingInfo() {
+    var m = st.meta || {}, v = m.video || {};
+    return { title: m.title || '', type: v.type || '', metaId: v.metaId || '', videoId: v.id || '', poster: m.poster || '' };
+  }
+  function stateText(i) {
+    if (i.state === 'done') return '已下载 · ' + fmtSize(i.size);
+    if (i.state === 'failed') return '失败：' + (i.error || '');
+    if (i.state === 'queued') return '排队中';
+    var pct = i.size ? Math.floor(i.downloaded * 100 / i.size) + '%' : fmtSize(i.downloaded);
+    return '下载中 ' + pct + (i.speed ? ' · ' + (i.speed / 1e6).toFixed(1) + ' MB/s' : '') + (i.peers != null ? ' · ' + i.peers + ' 个连接' : '') + (i.note ? ' · ' + i.note : '');
+  }
+
+  // The bar above the subtitles menu: one cell about the stream that is playing.
+  function downloadKey() {
+    var spec = st.meta && st.meta.stream, i = libItem(spec);
+    return [spec ? spec.infoHash || 'local' : null, i ? [i.state, i.size ? Math.floor(i.downloaded * 100 / i.size) : 0, Math.round((i.speed || 0) / 1e5), i.error] : [st.lib.loaded, st.lib.error]];
+  }
+  function downloadCell() {
+    var spec = st.meta && st.meta.stream;
+    if (!spec) return null;
+    var open = button('下载管理', function () { openPanel('library'); });
+    open.className += ' ss-ghost';
+    if (spec.local) return cell(el('span', 'ss-muted', '正在从服务器本地播放'), open);
+    if (!st.lib.loaded && !st.lib.error) { refreshLibrary(); return null; }
+    var i = libItem(spec);
+    if (!i) { var b = button('下载到服务器', function () { startDownload(spec, playingInfo()); }); b.title = '服务器后台把整部片下完，以后从服务器直接播放；现在可以照常继续看'; return cell(b, open); }
+    if (i.state === 'failed') return cell(el('span', null, '服务器下载失败'), button('重试', function () { libFetch('POST', '/' + i.id + '/retry').then(refreshLibrary); }), open);
+    scheduleLibPoll();
+    return cell(el('span', i.state === 'done' ? 'ss-muted' : null, '服务器：' + stateText(i)), open);
+  }
+
+  // The title that is open on a details page, and its torrent streams.
+  function refreshPage() {
+    var core = window.core;
+    if (st.video || !core || typeof core.getState !== 'function' || !/^#\/(detail|metadetails)\//.test(location.hash)) {
+      if (st.page) { st.page = null; renderPanel(); }
+      return Promise.resolve(null);
+    }
+    var href = location.hash;
+    return Promise.resolve().then(function () { return core.getState('meta_details'); }).then(function (md) {
+      if (!md || location.hash !== href) return null;
+      var item = md.metaItem && md.metaItem.content && md.metaItem.content.type === 'Ready' ? md.metaItem.content.content : null;
+      var sp = md.selected && md.selected.streamPath ? md.selected.streamPath : null;
+      var title = item && item.name ? String(item.name) : '';
+      if (item && sp && Array.isArray(item.videos)) item.videos.forEach(function (v) {
+        if (v.id === sp.id && typeof v.season === 'number' && typeof v.episode === 'number' && v.season > 0) title += ' S' + (v.season < 10 ? '0' : '') + v.season + 'E' + (v.episode < 10 ? '0' : '') + v.episode;
+      });
+      var list = [];
+      (md.streams || []).forEach(function (g) {
+        var addon = g.addon && g.addon.manifest ? String(g.addon.manifest.name || '') : '';
+        var ready = g.content && g.content.type === 'Ready' && Array.isArray(g.content.content) ? g.content.content : [];
+        ready.forEach(function (s0) { var spec = streamSpec(s0); if (spec && spec.infoHash) list.push({ spec: spec, addon: addon, name: String(s0.name || '').replace(/\s+/g, ' '), text: String(s0.description || s0.title || '') }); });
+      });
+      var sig = JSON.stringify([title, sp, list.map(function (o) { return o.spec.infoHash + o.spec.fileIdx; })]);
+      if (st.page && st.page.sig === sig) return st.page;
+      st.page = { sig: sig, info: { title: title, type: sp ? sp.type : (item && item.type) || '', metaId: item ? String(item.id || '') : '', videoId: sp ? String(sp.id) : '', poster: item && typeof item.poster === 'string' ? item.poster : '' }, streams: sp ? list : [] };
+      renderPanel();
+      return st.page;
+    }).catch(function () { return null; });
+  }
+
+  function renderLibrary(panel) {
+    var scroll = panel.querySelector('.ss-vl'), keep = scroll ? scroll.scrollTop : 0;
+    var u = st.lib.usage;
+    panel.textContent = '';
+    panelHead(panel, u ? '已用 ' + fmtSize(u.used) + ' / ' + fmtSize(u.max) : '');
+    var list = el('div', 'ss-vl');
+    if (u) {
+      var bar = el('div', 'ss-lp'), fill = el('i'); fill.style.width = Math.min(100, u.max ? u.used * 100 / u.max : 0) + '%'; bar.appendChild(fill); list.appendChild(bar);
+      if (u.free != null) list.appendChild(el('div', 'ss-muted', '服务器磁盘剩余 ' + fmtSize(u.free)));
+    }
+    if (st.lib.error) list.appendChild(el('div', 'ss-muted', '读取下载列表失败：' + st.lib.error));
+
+    // what can be downloaded here: the stream that is playing, or the torrent streams of the open title
+    var offers = [], info = null;
+    if (st.video && st.meta && st.meta.stream && st.meta.stream.infoHash) { info = playingInfo(); offers = [{ spec: st.meta.stream, addon: '', name: '正在播放的片源', text: st.meta.stream.filename || '' }]; }
+    else if (!st.video && st.page && st.page.streams.length) { info = st.page.info; offers = st.page.streams; }
+    if (offers.length) {
+      list.appendChild(el('div', 'ss-lsec', st.video ? '正在播放' : '「' + (info.title || '') + '」的片源（' + offers.length + '）'));
+      offers.slice(0, 60).forEach(function (o) {
+        var it = el('div', 'ss-li'), have = libItem(o.spec);
+        it.appendChild(el('div', 'ss-lt', o.addon && o.name.indexOf(o.addon) !== 0 ? o.addon + ' · ' + o.name : o.name || o.addon)); // Torrentio's names start with "Torrentio"
+        if (o.text) it.appendChild(el('div', 'ss-ln', o.text.split('\n').slice(0, 3).join(' · ')));
+        var row = el('div', 'ss-lr');
+        if (have) row.appendChild(el('span', 'ss-muted', stateText(have)));
+        else { var b = el('button', 'ss-btn', '下载到服务器'); b.__ssAct = function () { startDownload(o.spec, info); }; row.appendChild(b); }
+        it.appendChild(row);
+        list.appendChild(it);
+      });
+    } else if (!st.video && /^#\/(detail|metadetails)\//.test(location.hash)) {
+      list.appendChild(el('div', 'ss-lsec', '本片片源'));
+      list.appendChild(el('div', 'ss-muted', st.page ? '这里还没有可下载的种子片源（先选一集，或等片源列表加载完再打开）。' : '读取中…'));
+    }
+
+    list.appendChild(el('div', 'ss-lsec', '服务器上的影片（' + st.lib.items.length + '）'));
+    if (!st.lib.loaded && !st.lib.error) list.appendChild(el('div', 'ss-muted', '读取中…'));
+    else if (!st.lib.items.length) list.appendChild(el('div', 'ss-muted', '还没有下载。播放时在字幕菜单上方点「下载到服务器」，或在影片详情页打开这个面板选片源。下载好的片子会排在片源列表第一条，标「已下载」。'));
+    st.lib.items.forEach(function (i) {
+      var it = el('div', 'ss-li');
+      it.appendChild(el('div', 'ss-lt', i.title || i.name || i.infoHash.slice(0, 8)));
+      if (i.name && i.name !== i.title) it.appendChild(el('div', 'ss-ln', i.name));
+      if (i.state === 'downloading' || i.state === 'queued') {
+        var p = el('div', 'ss-lp'), f = el('i'); f.style.width = (i.size ? i.downloaded * 100 / i.size : 0) + '%'; p.appendChild(f); it.appendChild(p);
+      }
+      var row = el('div', 'ss-lr');
+      row.appendChild(el('span', i.state === 'failed' ? null : 'ss-muted', stateText(i) + (i.state === 'downloading' && i.eta != null ? ' · 剩余 ' + fmtEta(i.eta) : '')));
+      if (i.state === 'failed') { var re = el('button', 'ss-btn', '重试'); re.__ssAct = function () { libFetch('POST', '/' + i.id + '/retry').then(refreshLibrary); }; row.appendChild(re); }
+      if (i.state === 'done' && i.metaId && !(st.meta && st.meta.video && st.meta.video.id === i.videoId && st.video)) {
+        var go = el('button', 'ss-btn ss-ghost', '打开'); go.title = '打开这部片的片源列表，第一条「已下载」就是服务器上的文件';
+        go.__ssAct = function () { closePanel(); location.hash = '#/detail/' + encodeURIComponent(i.type) + '/' + encodeURIComponent(i.metaId) + (i.videoId ? '/' + encodeURIComponent(i.videoId) : ''); };
+        row.appendChild(go);
+      }
+      var sure = st.lib.confirm === i.id;
+      var del = el('button', 'ss-btn ' + (sure ? 'ss-warn' : 'ss-ghost'), sure ? '确认删除' : i.state === 'done' || i.state === 'failed' ? '删除' : '取消下载');
+      del.__ssAct = function () {
+        if (st.lib.confirm !== i.id) { st.lib.confirm = i.id; renderPanel(); return; }
+        st.lib.confirm = null;
+        libFetch('DELETE', '/' + i.id).catch(function (e) { toast('删除失败：' + e.message, 'error'); }).then(refreshLibrary);
+      };
+      row.appendChild(del);
+      it.appendChild(row);
+      list.appendChild(it);
+    });
+    panel.appendChild(list);
+    list.scrollTop = keep;
+  }
+
+  // A second button in the player's control bar, next to the vocabulary one, and one in the top bar of
+  // the other pages (that is where the streams of a title are).
+  function iconButton(sample, title, icon, extraClass) {
+    var b = el('div');
+    b.className = String(sample.className).split(/\s+/).filter(function (c) { return c && c !== 'disabled' && c !== 'active'; }).concat(extraClass).join(' ');
+    b.title = title; b.tabIndex = -1;
+    var ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg'), path = document.createElementNS(ns, 'path');
+    var sampleSvg = sample.querySelector('svg');
+    if (sampleSvg && sampleSvg.getAttribute('class')) svg.setAttribute('class', sampleSvg.getAttribute('class')); else { svg.style.width = '1.8rem'; svg.style.height = '1.8rem'; }
+    svg.setAttribute('viewBox', '0 0 24 24');
+    path.setAttribute('d', icon); path.setAttribute('fill', 'currentColor');
+    svg.appendChild(path); b.appendChild(svg);
+    b.addEventListener('click', function (e) { e.stopPropagation(); e.preventDefault(); togglePanel('library'); });
+    b.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+    return b;
+  }
+  function ensureDownloadButton() {
+    if (!st.video || !st.vbtn || !st.vbtn.parentNode) return;
+    if (st.dbtn && st.dbtn.parentNode === st.vbtn.parentNode) return;
+    st.dbtn = iconButton(st.vbtn, '下载到服务器 / 已下载的影片', DL_ICON, 'ss-vbtn');
+    st.dbtn.className = st.vbtn.className;
+    st.vbtn.parentNode.insertBefore(st.dbtn, st.vbtn.nextSibling);
+  }
+  function ensureNavButton() {
+    if (st.video) { if (st.nbtn && st.nbtn.parentNode) st.nbtn.parentNode.removeChild(st.nbtn); return; }
+    if (st.panelOpen && st.panelMode === 'library') refreshPage(); // streams keep arriving while the page loads
+    var host = document.querySelector('nav[class*="horizontal-nav-bar-container"] [class*="buttons-container"]');
+    if (!host) return;
+    if (st.nbtn && st.nbtn.parentNode === host) return;
+    var sample = null;
+    Array.prototype.forEach.call(host.querySelectorAll('[class*="button-container"]'), function (c) { if (!sample || /menu-button/.test(String(sample.className))) sample = c; });
+    if (!sample) return;
+    st.nbtn = iconButton(sample, '下载到服务器 / 已下载的影片', DL_ICON, 'ss-vbtn');
+    host.insertBefore(st.nbtn, host.firstChild);
+  }
+
   function wordTarget(e) {
     var n = e.target;
     return n && n.nodeType === 1 && n.classList && n.classList.contains('ss-w') && containerOf(n) ? n : null;
@@ -1271,6 +1514,8 @@
   ['mousedown', 'mouseup', 'dblclick'].forEach(function (type) {
     window.addEventListener(type, function (e) {
       if (wordTarget(e) || inPopup(e.target) || inPanel(e.target)) e.stopImmediatePropagation();
+      if (type === 'mousedown' && inPanel(e.target)) st.panelPressed = true;
+      if (type === 'mouseup' && st.panelPressed) setTimeout(function () { st.panelPressed = false; if (st.panelDirty) { st.panelDirty = false; renderPanel(); } }, 0); // after the click
       if (type === 'mouseup' && containerOf(e.target)) {
         var sel = window.getSelection ? String(window.getSelection()).replace(/\s+/g, ' ').trim() : '';
         if (sel && /\s/.test(sel) && sel.length <= 200) {
