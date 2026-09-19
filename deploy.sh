@@ -84,6 +84,14 @@ if [ -n "${WEB_DIR:-}" ] && [ -f "$WEB_DIR/index.html" ]; then
     cp -n "$WEB_DIR/index.html" "$WEB_DIR/index.html.bak-subsync"
     sed -i 's#</body>#<script src="subsync-ui.js"></script></body>#' "$WEB_DIR/index.html"
   fi
+  echo "== stremio-web player: HEVC is transcoded unless the viewer opts in (subsync-early.js, before the bundle)"
+  install -m644 "$S/subsync-early.js" "$WEB_DIR/subsync-early.js"
+  if ! grep -q 'subsync-early.js' "$WEB_DIR/index.html"; then
+    cp -n "$WEB_DIR/index.html" "$WEB_DIR/index.html.bak-subsync"
+    # in front of the first script of the bundle: the player asks about codecs while it loads
+    sed -i '0,/<script src="[^"]*\/scripts\/main\.js/s##<script src="subsync-early.js"></script>&#' "$WEB_DIR/index.html"
+    grep -q 'subsync-early.js' "$WEB_DIR/index.html" || echo "warning: main.js script tag not found in index.html, subsync-early.js is not loaded"
+  fi
   echo "== stremio-web player: let hls.js step over small gaps between segments"
   # stremio-web sets maxBufferHole:0. HEVC passed through from an open-GOP source leaves a gap of a few
   # frames at every segment boundary; with 0, hls.js reloads the same segment about once a second until

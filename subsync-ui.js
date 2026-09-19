@@ -19,7 +19,7 @@
   var SUB_RE = /\/sub\/([0-9a-f]{16})\/([^/?#]+)\.srt(?:\?([^#]*))?$/;
   var CHI = { chi: 1, zho: 1, zht: 1, zhs: 1, chs: 1, cht: 1, ze: 1, zh: 1 };
   var TRAD = '繁体中文'; // the addon lists Traditional Chinese as a language of its own, named like this
-  var LS_BI = 'subsync.bilingual', LS_HOVER = 'subsync.hoverPause', LS_SP = 'subsync.sentencePause', LS_PROFILE = 'subsync.profile', LS_VOICE = 'subsync.voice';
+  var LS_BI = 'subsync.bilingual', LS_HOVER = 'subsync.hoverPause', LS_SP = 'subsync.sentencePause', LS_PROFILE = 'subsync.profile', LS_VOICE = 'subsync.voice', LS_HEVC = 'subsync.hevcDirect';
   var POLL_MS = 2500;
   var SP_MARGIN = 120; // sentence pause stops this many ms before the cue ends, so its text stays on screen
   var ORIGIN = '字幕对齐';
@@ -605,7 +605,7 @@
     var s = st.status, p = mine(selectedTrack());
     var biNow = isBilingual(p), hover = pref(LS_HOVER, true), sp = spOn, voiceOn = pref(LS_VOICE, true);
     var key = JSON.stringify([st.shortKey, !s ? null : s.missing ? 'missing' : [s.align.state, s.align.running, s.align.phase, s.align.done, s.align.total, s.align.error,
-      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, sp, voiceOn, st.selectedId, st.embeddedId, st.wantBi, downloadKey()]);
+      s.translate.enabled, s.translate.state, s.translate.done, s.translate.total, s.translate.stale, s.translate.error, s.best, s.hasEng, s.hasHumanZh], biNow, hover, sp, voiceOn, st.selectedId, st.embeddedId, st.wantBi, downloadKey(), pref(LS_HEVC, false)]);
     if (key === st.barKey) return; // nothing changed: leave the DOM alone (the menu observer would loop otherwise)
     st.barKey = key;
     bar.textContent = '';
@@ -659,6 +659,16 @@
     }
     bar.appendChild(check('悬停字幕暂停', LS_HOVER, hover));
     bar.appendChild(check('点词发音', LS_VOICE, voiceOn));
+    // Only where the browser itself can play HEVC (see subsync-early.js): off = such videos are transcoded.
+    var hv = window.__subsyncHevc;
+    if (hv && hv.native) {
+      var hc = check('HEVC 原画直通', LS_HEVC, pref(LS_HEVC, false));
+      hc.title = '关（默认）：x265 片源由服务器转成 H.264，画面连续。开：原画直通、不重新编码，但多数 x265 片源每 10 秒左右会跳几帧。改动后要刷新页面才生效。';
+      hc.querySelector('input').addEventListener('change', function () {
+        toast('HEVC 原画直通已' + (pref(LS_HEVC, false) ? '打开' : '关闭') + '，刷新页面后生效', 'info', 12000, { label: '现在刷新', onClick: function () { location.reload(); } });
+      });
+      bar.appendChild(hc);
+    }
     bar.appendChild(el('span', 'ss-muted', '点单词查词，弹窗里「＋ 生词本」收藏'));
   }
 
